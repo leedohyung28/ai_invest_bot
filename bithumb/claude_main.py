@@ -45,7 +45,7 @@ logger.addHandler(console_handler)
 # ---------------------------
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
-TARGET_EMAIL = "dhleee0123@gmail.com"
+TARGET_EMAIL = os.getenv("TARGET_EMAIL")
 EMAIL_INTERVAL = 30 * 60  # 30분
 
 def get_new_log_filename():
@@ -165,9 +165,9 @@ class StrategyConfig:
 
 @dataclass
 class Config:
-    db_path: str = "bithumb_swing.db"
-    ollama_url: str = "http://localhost:11434/api/chat"
-    ollama_model: str = "qwen2.5:7b"
+    db_path: str = os.getenv("DB_PATH")
+    ollama_url: str = os.getenv("OLLAMA_URL")
+    ollama_model: str = os.getenv("OLLAMA_MODEL")
     quote: str = "KRW"
     exclude: tuple = ("BTC", "ETH")  # AI 관리 대상에서 제외
     universe_size: int = 200
@@ -790,7 +790,7 @@ def print_portfolio_summary():
     """AI 관리 자산 포트폴리오 요약"""
     portfolio = get_total_portfolio_value()
     
-    log_print(f"\n{'='*60}")
+    log_print(f"{'='*60}")
     log_print(f"[PORTFOLIO] AI 관리 자산 요약")
     log_print(f"  (BTC, ETH 등 수동 투자 자산 제외)")
     log_print(f"{'='*60}")
@@ -799,7 +799,7 @@ def print_portfolio_summary():
     log_print(f"총 자산: {portfolio['total_krw']:,.0f}원")
     
     if portfolio['coins']:
-        log_print(f"\nAI 관리 코인 ({len(portfolio['coins'])}개):")
+        log_print(f"AI 관리 코인 ({len(portfolio['coins'])}개):")
         for coin, info in sorted(portfolio['coins'].items(), 
                                 key=lambda x: x[1]['value_krw'], 
                                 reverse=True):
@@ -1255,7 +1255,7 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
                 db_remove_position(market)
                 continue
                 
-            log_print(f"\n[EXIT] 청산: {market} @ {current_price:,.0f}원 (수량: {actual_balance})")
+            log_print(f"[EXIT] 청산: {market} @ {current_price:,.0f}원 (수량: {actual_balance})")
             
             # 조회된 실제 수량(actual_balance)으로 매도 실행
             exit_result = execute_order(
@@ -1301,16 +1301,16 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
                 ai_managed_positions += 1
     
     if ai_managed_positions >= params.max_positions:
-        log_print(f"\n[INFO] 최대 포지션 수 도달 ({ai_managed_positions}/{params.max_positions})")
+        log_print(f"[INFO] 최대 포지션 수 도달 ({ai_managed_positions}/{params.max_positions})")
         return
     
     available_krw = get_available_krw_balance()
     
     if available_krw < CFG.min_order_krw:
-        log_print(f"\n[INFO] 잔고 부족 ({available_krw:,.0f}원)")
+        log_print(f"[INFO] 잔고 부족 ({available_krw:,.0f}원)")
         return
     
-    log_print(f"\n[INFO] 사용 가능 잔고: {available_krw:,.0f}원")
+    log_print(f"[INFO] 사용 가능 잔고: {available_krw:,.0f}원")
     
     last_entries = db_get_meta("last_entries", "{}")
     last_entries = json.loads(last_entries)
@@ -1346,7 +1346,7 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
         log_print("[INFO] 진입 가능한 시그널 없음")
         return
     
-    log_print(f"\n[SIGNAL] 감지된 시그널: {len(signals)}개")
+    log_print(f"[SIGNAL] 감지된 시그널: {len(signals)}개")
     
     # 3) 포지션 크기 계산 및 주문
     available_slots = params.max_positions - ai_managed_positions
@@ -1385,10 +1385,10 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
 
         
         if buy_info["total"] > available_krw:
-            log_print(f"\n[SKIP] {market} 잔고 부족")
+            log_print(f"[SKIP] {market} 잔고 부족")
             continue
         
-        log_print(f"\n[ENTRY] 진입 준비: {market}")
+        log_print(f"[ENTRY] 진입 준비: {market}")
         log_print(f"  가격: {signal['price']:,.0f}원")
         log_print(f"  수량: {size:.6f}")
         log_print(f"  총액: {buy_info['total']:,.0f}원")
@@ -1468,7 +1468,7 @@ def build_universe():
                 if currency.upper() not in [x.upper() for x in CFG.exclude]:
                     krw_markets.append(market_id)
         
-        log_print(f"\n[UNIVERSE] AI 관리 유니버스: {len(krw_markets)}개")
+        log_print(f"[UNIVERSE] AI 관리 유니버스: {len(krw_markets)}개")
         log_print(f"  제외 (사용자 직접 투자): {', '.join(CFG.exclude)}")
         
         return krw_markets[:CFG.universe_size]
@@ -1594,7 +1594,7 @@ def run():
     init_db()
     pub = BithumbPublic()
 
-    log_print("\n[LOADING] 마켓 데이터 로딩...")
+    log_print("[LOADING] 마켓 데이터 로딩...")
     universe = build_universe()
     
     if not universe:
@@ -1614,12 +1614,12 @@ def run():
     while True:
         t0 = time.time()
         cycle += 1
-        log_print(f"\n{'='*60}")
+        log_print(f"{'='*60}")
         log_print(f"[CYCLE #{cycle}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log_print(f"{'='*60}")
 
         # 1) 캔들 수집
-        log_print("\n[DATA] 캔들 수집...")
+        log_print("[DATA] 캔들 수집...")
         collected = 0
         
         for market in universe[:50]:
@@ -1645,7 +1645,7 @@ def run():
 
         # 2) AI 학습
         if time.time() - last_ai > CFG.ai_refresh_min * 60:
-            log_print("\n[AI] 학습 시작...")
+            log_print("[AI] 학습 시작...")
             
             performance = analyze_trading_performance()
             
@@ -1670,13 +1670,13 @@ def run():
             log_print(f"[AI] 학습 완료")
 
         # 3) 리밸런싱
-        log_print("\n[REBALANCE] 리밸런싱...")
+        log_print("[REBALANCE] 리밸런싱...")
         rebalance_portfolio(universe, PARAMS, STRATEGY)
         
         # 4) 포지션 요약
         positions = db_get_positions()
         if not positions.empty:
-            log_print(f"\n[POSITION] 현재 포지션:")
+            log_print(f"[POSITION] 현재 포지션:")
             
             ai_positions = []
             excluded_positions = []
@@ -1701,9 +1701,9 @@ def run():
                         total_pnl += pnl_krw
                         log_print(f"    {pos['market']}: {pnl_krw:+,.0f}원")
                 
-                log_print(f"\n  미실현 손익: {total_pnl:+,.0f}원")
+                log_print(f"  미실현 손익: {total_pnl:+,.0f}원")
         else:
-            log_print("\n[POSITION] 포지션 없음")
+            log_print("[POSITION] 포지션 없음")
         
         # 5) 포트폴리오 요약
         print_portfolio_summary()
