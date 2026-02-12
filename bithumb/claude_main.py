@@ -180,6 +180,7 @@ class Params:
     max_positions: int = 8
     max_coin_weight: float = 0.30
     risk_per_trade: float = 0.08
+    position_allocation_pct: float = 0.1
     atr_mult_stop: float = 2.5
     breakout_lookback: int = 2
     trend_ma_fast: int = 10
@@ -1488,7 +1489,7 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
         if signal["signal"] == "sell":
             continue
             
-        position_size_krw = min(500_000, available_krw * 0.08)
+        position_size_krw = min(500_000, available_krw * params.position_allocation_pct)
         risk_krw = position_size_krw * params.risk_per_trade
         price_risk = abs(signal["price"] - signal["stop"])
         
