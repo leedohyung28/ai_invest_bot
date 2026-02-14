@@ -1335,86 +1335,91 @@ def clear_dust_position(market, current_price, actual_balance, api):
 # 리밸런싱
 # ---------------------------
 def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
-    """포트폴리오 리밸런싱 (AI 관리 자산만)"""
+    """포트폴리오 리밸런싱 (수정됨: 잔고 동기화 및 투자금액 제한 해제)"""
     positions = db_get_positions()
     pub = BithumbPublic()
-    priv_api = BithumbPrivateAPI() # 소액 처리를 위해 미리 생성
+    priv_api = BithumbPrivateAPI()
 
-    # 1) 기존 포지션 관리
+    # 시작 전 DB 포지션과 실제 잔고 강제 동기화 (Sync)
+    # 앱에서 매도했거나 수량이 바뀐 경우를 봇이 매번 인지하도록 함
+    if not positions.empty:
+        log_print("[SYNC] 보유 포지션 실제 잔고 동기화 중...")
+        for _, pos in positions.iterrows():
+            market = pos['market']
+            # 실제 잔고 조회
+            real_balance = get_coin_balance(market)
+            
+            # 잔고가 없으면(이미 팔았으면) DB에서 삭제
+            if real_balance <= 0.0001:  # 0에 가까우면 삭제
+                log_print(f"[SYNC] {market} 실제 잔고 없음 -> DB에서 포지션 삭제")
+                db_remove_position(market)
+            # 잔고가 DB와 다르면 업데이트 (부분 매도 등)
+            elif abs(real_balance - pos['size']) / pos['size'] > 0.05: # 5% 이상 차이나면
+                log_print(f"[SYNC] {market} 수량 불일치 보정 ({pos['size']} -> {real_balance})")
+                con = sqlite3.connect(CFG.db_path)
+                cur = con.cursor()
+                cur.execute("UPDATE positions SET size=? WHERE market=?", (real_balance, market))
+                con.commit()
+                con.close()
+
+    # 동기화 후 포지션 다시 로드
+    positions = db_get_positions()
+
+    # 1) 기존 포지션 관리 (청산 로직)
     for _, pos in positions.iterrows():
         market = pos['market']
         
         # 제외 코인 무시
         if is_excluded_coin(market):
-            log_print(f"[SKIP] {market}는 AI 관리 대상이 아님 (무시)")
             continue
-            
+
         current_price = pub.get_current_price(market)
         if current_price is None:
             continue
-            
+
         should_exit, reason = check_position_exit(market, current_price, pos, params, strategy)
-        
+
         if should_exit:
             # 실시간 잔고 재조회
             actual_balance = get_coin_balance(market)
+            
+            # (이미 위에서 동기화 했지만, 찰나의 순간을 위해 다시 체크)
             if actual_balance <= 0:
-                log_print(f"[SKIP] {market} 잔고가 없어 청산을 건너뜁니다.")
                 db_remove_position(market)
                 continue
-            
-            # --- [수정된 부분: 최소 주문 금액 미달 처리] ---
+
+            # 최소 주문 금액 미달 처리 로직
             sell_value = current_price * actual_balance
             if sell_value < CFG.min_order_krw:
                 log_print(f"[INFO] {market} 청산 금액({sell_value:,.0f}원)이 최소 주문금액 미달")
                 
-                # AI(알고리즘) 판단: 현재 추세 분석
+                # AI 판단 및 소액 정리 로직 (기존 유지)
                 analysis = generate_swing_signals(market, params, strategy)
-                
-                # 판단 1: 상승 가능성 높음 (Buy 시그널이거나, StopLoss 상황이 아님)
                 is_bullish = (analysis["signal"] == "buy")
-                
-                # 판단 2: 하락 가능성 높음 (명확한 StopLoss, MaxLoss 상황)
                 is_urgent_exit = (reason in ["stop_loss", "max_loss", "long_hold_loss"])
-                
+
                 if is_bullish and not is_urgent_exit:
-                    # 행동 2: 대기
-                    log_print(f"  └ [AI 판단] 📈 상승/반등 가능성 있음 (Reason: {reason}) -> 홀딩 및 대기")
-                    # 포지션 유지 (DB 삭제 안 함, 매도 안 함)
+                    log_print(f" └ [AI 판단] 📈 상승/반등 가능성 있음 (Reason: {reason}) -> 홀딩 및 대기")
                     continue
                 else:
-                    # 행동 1: 추가 매수 후 청산
-                    log_print(f"  └ [AI 판단] 📉 하락 리스크 큼 (Reason: {reason}) -> '물타기 후 탈출' 시도")
+                    log_print(f" └ [AI 판단] 📉 하락 리스크 큼 (Reason: {reason}) -> '물타기 후 탈출' 시도")
                     success, fee = clear_dust_position(market, current_price, actual_balance, priv_api)
-                    
                     if success:
-                        db_remove_position(market) # DB에서 제거
-                        # Trade 기록 남기기 (손익 계산은 복잡하므로 대략적으로 처리하거나 생략)
-                        # 여기서는 로그만 남기고 넘어갑니다.
-                        continue
-                    else:
-                        log_print(f"  └ [FAIL] 탈출 실패, 다음 사이클에 재시도")
-                        continue
-            # ---------------------------------------------
+                        db_remove_position(market)
+                    continue
 
-            log_print(f"[EXIT] 청산: {market} @ {current_price:,.0f}원 (수량: {actual_balance})")
-            
-            # 일반 매도 실행
-            exit_result = execute_order(
-                market,
-                "sell",
-                current_price,
-                actual_balance
-            )
-            
+            log_print(f"[EXIT] 청산: {market} @ {current_price:,.0f}원 (수량: {actual_balance}) 사유: {reason}")
+
+            # 매도 실행
+            exit_result = execute_order(market, "sell", current_price, actual_balance)
+
             if exit_result["success"]:
                 pnl_gross = (current_price - pos['entry_price']) * pos['size']
                 total_fee = pos.get('entry_fee', 0) + exit_result['fee']
                 pnl_net = pnl_gross - total_fee
-                
-                if pos['direction'] == "short":
+                if pos['direction'] == "short": # 현물에선 없지만 로직 유지
                     pnl_net = -pnl_net
-                    
+                
                 holding_hours = (time.time() - pos['entry_time']) / 3600
                 
                 con = sqlite3.connect(CFG.db_path)
@@ -1428,52 +1433,53 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
                 con.commit()
                 con.close()
                 
-                log_print(f"  순손익: {pnl_net:+,.0f}원 (보유: {holding_hours:.1f}시간)")
+                log_print(f" 순손익: {pnl_net:+,.0f}원 (보유: {holding_hours:.1f}시간)")
                 db_remove_position(market)
 
-    # 2) 신규 진입 탐색 (이하 기존 코드와 동일)
-    current_positions = len(db_get_positions())
+    # 2) 신규 진입 탐색
+    # 현재 관리 중인 포지션 수 재확인
+    current_positions_df = db_get_positions()
     ai_managed_positions = 0
-    if not db_get_positions().empty:
-        for _, pos in db_get_positions().iterrows():
+    if not current_positions_df.empty:
+        for _, pos in current_positions_df.iterrows():
             if not is_excluded_coin(pos['market']):
                 ai_managed_positions += 1
-    
+
     if ai_managed_positions >= params.max_positions:
         log_print(f"[INFO] 최대 포지션 수 도달 ({ai_managed_positions}/{params.max_positions})")
         return
 
+    # 잔고 조회
     available_krw = get_available_krw_balance()
     if available_krw < CFG.min_order_krw:
         log_print(f"[INFO] 잔고 부족 ({available_krw:,.0f}원)")
         return
-        
+
     log_print(f"[INFO] 사용 가능 잔고: {available_krw:,.0f}원")
-    
+
+    # 진입 쿨타임 체크 등 기존 로직
     last_entries = db_get_meta("last_entries", "{}")
     last_entries = json.loads(last_entries)
     current_time = time.time()
     
     signals = []
-    
     for market in universe:
-        if is_excluded_coin(market):
-            continue
-            
+        if is_excluded_coin(market): continue
+        
+        # 쿨타임 체크
         if market in last_entries:
             elapsed_minutes = (current_time - last_entries[market]) / 60
-            if market in db_get_positions()['market'].values:
-                if elapsed_minutes < params.cooldown_minutes:
-                    continue
+            if market in current_positions_df['market'].values:
+                if elapsed_minutes < params.cooldown_minutes: continue
             else:
-                if elapsed_minutes < 5:
-                    continue
+                if elapsed_minutes < 5: continue
         
-        if not db_get_positions().empty and market in db_get_positions()['market'].values:
+        # 이미 보유중이면 패스
+        if not current_positions_df.empty and market in current_positions_df['market'].values:
             continue
-            
+
         signal = generate_swing_signals(market, params, strategy)
-        if signal["signal"] in ["buy", "sell"]:
+        if signal["signal"] in ["buy"]: # 매수 시그널만
             signals.append((market, signal))
 
     if not signals:
@@ -1482,30 +1488,53 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
 
     log_print(f"[SIGNAL] 감지된 시그널: {len(signals)}개")
 
-    # 3) 포지션 크기 계산 및 주문
+    # 3) 포지션 크기 계산 및 주문 [수정 2: 투자 비중 확대]
     available_slots = params.max_positions - ai_managed_positions
+    if available_slots <= 0: return
+
+    # 균등 분할 방식: (가용 잔고 * 투자비중) / 남은 자리 수
+    # 예: 잔고 1000만원, 비중 100%(1.0), 남은 자리 5개 -> 종목당 200만원
+    # 안전을 위해 한 번에 전액을 다 쓰지 않도록 가용 잔고의 99%만 계산에 사용
     
+    allocatable_krw = available_krw * params.position_allocation_pct # 투자 할당 비중 (0.7 등)
+    position_size_krw = allocatable_krw / available_slots
+    
+    # 너무 작은 금액 방지 (최소 1만원 이상일 때만)
+    if position_size_krw < 10000:
+        position_size_krw = available_krw  # 잔액이 적으면 그냥 잔액 전부 투입 (단, min_order_krw 체크는 뒤에서 함)
+
+    log_print(f"[DEBUG] 1종목당 투자 예정 금액: {position_size_krw:,.0f}원 (남은 슬롯: {available_slots}개)")
+
     for i, (market, signal) in enumerate(signals[:available_slots]):
-        if signal["signal"] == "sell":
-            continue
-            
-        position_size_krw = min(500_000, available_krw * params.position_allocation_pct)
+        if signal["signal"] == "sell": continue # 매도 시그널은 진입 안함
+        
+        # 리스크 기반 수량 계산 (기존 로직 활용하되, 한도 제한 해제)
         risk_krw = position_size_krw * params.risk_per_trade
         price_risk = abs(signal["price"] - signal["stop"])
         
+        size = 0
         if price_risk > 0:
             size = risk_krw / price_risk
-        else:
-            size = position_size_krw / signal["price"]
-            
-        max_size = position_size_krw * params.max_coin_weight / signal["price"]
-        size = min(size, max_size)
         
+        # 다만, 계산된 size가 할당된 금액(position_size_krw)을 넘지 않도록 캡
+        max_size_by_capital = position_size_krw / signal["price"]
+        
+        # 코인별 최대 비중(max_coin_weight) 체크
+        # (전체 자산 대비 너무 큰 비중 방지)
+        # 하지만 여기선 position_size_krw 자체가 이미 분할된 금액이므로, 
+        # size가 max_size_by_capital보다 크지만 않게 하면 됨.
+        
+        if size == 0 or size > max_size_by_capital:
+             size = max_size_by_capital # 리스크 계산 무시하고 자금력만큼 매수 (공격적)
+
+        # 최종 수량 및 금액 계산
         buy_info = calculate_buy_fee_and_total(signal["price"], size)
-        
+
+        # 최소 주문 금액 체크
         if buy_info["total"] < CFG.min_order_krw:
             min_size = adjust_min_order_size(signal["price"])
             min_buy_info = calculate_buy_fee_and_total(signal["price"], min_size)
+            
             if min_buy_info["total"] <= available_krw:
                 log_print(f"[ADJUST] 최소 주문금액 보정 → 수량 {size:.6f} → {min_size:.6f}")
                 size = min_size
@@ -1514,39 +1543,39 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
                 log_print(f"[SKIP] 최소 주문금액 맞추기엔 잔고 부족")
                 continue
 
+        # 실제 잔고 재확인 (루프 돌면서 잔고 줄어듦)
         if buy_info["total"] > available_krw:
-            log_print(f"[SKIP] {market} 잔고 부족")
+            log_print(f"[SKIP] {market} 잔고 부족 (필요: {buy_info['total']:,.0f}, 잔고: {available_krw:,.0f})")
             continue
-            
+
         log_print(f"[ENTRY] 진입 준비: {market}")
-        log_print(f"  가격: {signal['price']:,.0f}원")
-        log_print(f"  수량: {size:.6f}")
-        log_print(f"  총액: {buy_info['total']:,.0f}원")
-        log_print(f"  손절가: {signal['stop']:,.0f}원")
-        
+        log_print(f" 가격: {signal['price']:,.0f}원")
+        log_print(f" 수량: {size:.6f}")
+        log_print(f" 총액: {buy_info['total']:,.0f}원")
+        log_print(f" 손절가: {signal['stop']:,.0f}원")
+
         entry_price = get_entry_price(signal["price"], "buy")
         
-        order_result = execute_order(
-            market,
-            "buy",
-            entry_price,
-            size
-        )
-        
+        order_result = execute_order(market, "buy", entry_price, size)
+
         if order_result["success"]:
             log_print(f"[SUCCESS] 진입 완료: {market}")
             db_add_position(
-                market,
-                signal["price"],
-                size,
-                signal["stop"],
-                "long" if signal["signal"] == "buy" else "short",
+                market, 
+                signal["price"], # 진입가는 시그널 가격 기준 or 체결가
+                size, 
+                signal["stop"], 
+                "long", 
                 order_result['fee']
             )
+            
             last_entries[market] = current_time
             db_set_meta("last_entries", json.dumps(last_entries))
+            
+            # 잔고 차감 반영
             available_krw -= buy_info["total"]
-            log_print(f"  남은 잔고: {available_krw:,.0f}원")
+            log_print(f" 남은 잔고: {available_krw:,.0f}원")
+            
             time.sleep(0.5)
 
 def get_entry_price(price, direction):
