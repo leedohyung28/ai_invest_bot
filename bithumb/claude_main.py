@@ -46,7 +46,7 @@ logger.addHandler(console_handler)
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
 TARGET_EMAIL = os.getenv("TARGET_EMAIL")
-EMAIL_INTERVAL = 30 * 60  # 30분
+EMAIL_INTERVAL = 3 * 60 * 60  # 3시간
 
 def get_new_log_filename():
     """현재 시간 기준으로 새 로그 파일명 생성 (예: 2026_02_11_21_30.log)"""
@@ -77,48 +77,85 @@ def setup_logger():
 def send_email_and_rotate_log():
     """현재 로그 파일을 전송하고, 새로운 로그 파일로 교체"""
     global current_log_file, last_portfolio_value, last_email_time
-    
+
     file_to_send = current_log_file
     if not file_to_send or not os.path.exists(file_to_send):
         logger.warning("전송할 로그 파일이 없습니다.")
         return
-    
-    # 현재 포트폴리오 가치 계산
+
+    # 1) 포트폴리오
     current_portfolio = get_total_portfolio_value()
     current_value = current_portfolio['total_krw']
-    
-    # 수익률 계산
+
+    # 2) 3시간 전 대비(=직전 이메일 대비)
     if last_portfolio_value is None:
         last_portfolio_value = current_value
-    
-    profit_krw = current_value - last_portfolio_value
-    profit_pct = (profit_krw / last_portfolio_value * 100) if last_portfolio_value > 0 else 0
-    
-    # 이메일 본문 생성
+
+    diff_krw = current_value - last_portfolio_value
+    diff_pct = (diff_krw / last_portfolio_value * 100) if last_portfolio_value > 0 else 0
+
+    # 3) 승률/성과
+    perf = analyze_trading_performance()
+
+    # 4) AI Config 변경 내역(meta에서 읽기)
+    change_raw = db_get_meta("last_ai_config_change", None)
+    change_text = "(기록 없음)"
+    change_ts = None
+    if change_raw:
+        try:
+            obj = json.loads(change_raw)
+            change_text = obj.get("text", "(변경 없음)")
+            change_ts = obj.get("ts", None)
+        except Exception:
+            change_text = change_raw
+
+    # 5) 보유 코인 상세 문자열
+    coins_lines = []
+    coins = current_portfolio.get("coins", {})
+    if coins:
+        for coin, info in sorted(coins.items(), key=lambda x: x[1]['value_krw'], reverse=True):
+            coins_lines.append(
+                f"- {coin}: {info['balance']:.6f}개, 평가 {info['value_krw']:,.0f}원 (@ {info['price']:,.0f})"
+            )
+    else:
+        coins_lines.append("- (보유 코인 없음)")
+
     now = datetime.now()
-    subject = f"Trading Bot : {now.strftime('%Y/%m/%d %H:%M')} 로그"
-    
+    subject = f"Trading Bot : {now.strftime('%Y/%m/%d %H:%M')} (3시간 리포트)"
+
+    change_time_str = ""
+    if change_ts:
+        change_time_str = datetime.fromtimestamp(change_ts).strftime("%Y/%m/%d %H:%M")
+
     body = f"""
-=== 트레이딩 봇 리포트 ===
+=== 트레이딩 봇 3시간 리포트 ===
 
-📊 현재 수익률
-  - 총 자산: {current_value:,.0f}원
-  - 순손익: {profit_krw:+,.0f}원 ({profit_pct:+.2f}%)
+1) 3시간 전 대비 금액 증감
+- 현재 총 자산: {current_value:,.0f}원
+- 3시간 전(직전 리포트): {last_portfolio_value:,.0f}원
+- 증감: {diff_krw:+,.0f}원 ({diff_pct:+.2f}%)
 
-📈 전회 대비 (30분 전)
-  - 이전 자산: {last_portfolio_value:,.0f}원
-  - 변동 금액: {profit_krw:+,.0f}원
-  - 변동률: {profit_pct:+.2f}%
+2) AI Config 변동 내역
+- 마지막 변경 시각: {change_time_str if change_time_str else "(알 수 없음)"}
+{change_text}
 
-💰 포트폴리오 구성
-  - KRW 잔고: {current_portfolio['krw']:,.0f}원
-  - 코인 평가액: {current_portfolio['total_coin_value']:,.0f}원
-  - 보유 코인: {len(current_portfolio['coins'])}개
+3) 승률 / 최근 100거래 성과
+- 총 거래 수: {perf['total_trades']}
+- 승률: {perf['win_rate']*100:.1f}%
+- 총 손익: {perf['total_pnl']:+,.0f}원
+- 평균 이익: {perf['avg_profit']:+,.0f}원
+- 평균 손실: {-perf['avg_loss']:,.0f}원
+- 총 수수료: {perf['total_fees']:,.0f}원
 
-자세한 내용은 첨부된 로그 파일을 확인하세요.
-    """
-    
-    # 이메일 전송
+4) 포트폴리오 구성 (보유코인 포함)
+- KRW 잔고: {current_portfolio['krw']:,.0f}원
+- 코인 평가액: {current_portfolio['total_coin_value']:,.0f}원
+- 보유 코인 수: {len(coins)}
+{chr(10).join(coins_lines)}
+
+(상세 로그는 첨부 파일 참고)
+"""
+
     try:
         if GMAIL_USER and GMAIL_PASSWORD:
             msg = MIMEMultipart()
@@ -126,32 +163,31 @@ def send_email_and_rotate_log():
             msg['To'] = TARGET_EMAIL
             msg['Subject'] = subject
             msg.attach(MIMEText(body, 'plain'))
-            
-            # 로그 파일 첨부
+
             with open(file_to_send, 'rb') as f:
                 part = MIMEBase('application', 'octet-stream')
                 part.set_payload(f.read())
                 encoders.encode_base64(part)
                 part.add_header('Content-Disposition', f'attachment; filename={file_to_send}')
                 msg.attach(part)
-            
+
             server = smtplib.SMTP('smtp.gmail.com', 587)
             server.starttls()
             server.login(GMAIL_USER, GMAIL_PASSWORD)
             server.send_message(msg)
             server.quit()
-            
+
             logger.info(f"이메일 전송 성공: {file_to_send} -> {TARGET_EMAIL}")
-            
-            # 현재 값을 이전 값으로 업데이트
+
+            # 직전 리포트 값 업데이트 (다음 리포트에서 '3시간 전 대비'로 사용)
             last_portfolio_value = current_value
             last_email_time = time.time()
         else:
             logger.warning("이메일 설정이 없어 전송을 건너뜁니다.")
+
     except Exception as e:
         logger.error(f"이메일 전송 중 오류 발생: {e}")
-    
-    # 로그 파일 교체
+
     setup_logger()
 
 def log_rotation_scheduler():
@@ -337,6 +373,15 @@ def db_set_meta(k, v):
     con.commit()
     con.close()
 
+def save_ai_change_summary(changes_text: str):
+    """최근 AI 설정 변경 내역을 meta에 저장"""
+    if not changes_text:
+        changes_text = "(변경 없음)"
+    payload = {
+        "ts": int(time.time()),
+        "text": changes_text
+    }
+    db_set_meta("last_ai_config_change", json.dumps(payload, ensure_ascii=False))
 
 def db_get_meta(k, default=None):
     con = sqlite3.connect(CFG.db_path)
@@ -1645,30 +1690,29 @@ def filter_fields(cls, data: dict):
 def log_param_changes(old_params, new_params, old_strategy, new_strategy):
     """파라미터 및 전략 변경 사항을 상세 로그로 기록"""
     changes = []
-    
-    # Params 변경 사항 확인
-    old_p = asdict(old_params)
-    new_p = asdict(new_params)
-    
-    for key in old_p:
-        if old_p[key] != new_p[key]:
-            changes.append(f"  [PARAM] {key}: {old_p[key]} -> {new_p[key]}")
-    
-    # StrategyConfig 변경 사항 확인
-    old_s = asdict(old_strategy)
-    new_s = asdict(new_strategy)
-    
-    for key in old_s:
-        if old_s[key] != new_s[key]:
-            changes.append(f"  [STRATEGY] {key}: {old_s[key]} -> {new_s[key]}")
-    
-    if changes:
-        log_print("[AI_REBALANCE] 파라미터 및 전략 변경:")
-        for change in changes:
-            log_print(change)
-    else:
-        log_print("[AI_REBALANCE] 변경 사항 없음")
 
+    oldp = asdict(old_params)
+    newp = asdict(new_params)
+    for key in oldp:
+        if oldp[key] != newp[key]:
+            changes.append(f"PARAM {key}: {oldp[key]} -> {newp[key]}")
+
+    olds = asdict(old_strategy)
+    news = asdict(new_strategy)
+    for key in olds:
+        if olds[key] != news[key]:
+            changes.append(f"STRATEGY {key}: {olds[key]} -> {news[key]}")
+
+    if changes:
+        log_print("[AI_REBALANCE] Config 변경 감지:")
+        for c in changes:
+            log_print(" - " + c)
+        text = "\n".join(changes)
+    else:
+        log_print("[AI_REBALANCE] Config 변경 없음")
+        text = "(변경 없음)"
+
+    return text
 # ---------------------------
 # AI Controller
 # ---------------------------
@@ -1749,8 +1793,9 @@ def ollama_update_params_and_strategy(performance: dict, learning_history: pd.Da
         ))
         
         # ✨ 변경 사항 로그 추가
-        log_param_changes(current_params, new_params, current_strategy, new_strategy)
-        
+        change_text = log_param_changes(PARAMS, new_params, STRATEGY, new_strategy)
+        save_ai_change_summary(change_text)
+
         performance_score = (
             performance["win_rate"] * performance["profit_factor"]
             if performance["total_trades"] > 0 else 0
