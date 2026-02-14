@@ -177,10 +177,10 @@ last_email_time = 0  # 마지막 이메일 전송 시각
 # ---------------------------
 @dataclass
 class Params:
-    max_positions: int = 8
-    max_coin_weight: float = 0.30
+    max_positions: int = 5
+    max_coin_weight: float = 0.5
     risk_per_trade: float = 0.08
-    position_allocation_pct: float = 0.1
+    position_allocation_pct: float = 0.7
     atr_mult_stop: float = 2.5
     breakout_lookback: int = 2
     trend_ma_fast: int = 10
@@ -211,7 +211,7 @@ class Config:
     universe_size: int = 200
     collect_interval_sec: int = 300
     ai_refresh_min: int = 30
-    fee_rate: float = 0.0025  # 빗썸 수수료 0.25%
+    fee_rate: float = 0  # 빗썸 수수료 0.25%
     min_order_krw: float = 7000  # 최소 주문 금액
 
 
@@ -1136,7 +1136,7 @@ def check_position_exit(market, current_price, position_row, params: Params, str
 # ---------------------------
 # 주문 실행 (API 2.0)
 # ---------------------------
-def execute_order(market, direction, price, size, wait_sec=20):
+def execute_order(market, direction, price, size, wait_sec=30):
     """
     주문 실행 함수
     - 매수: 지정가 실패 → 시장가 매수
@@ -1456,7 +1456,7 @@ def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
     
     signals = []
     
-    for market in universe[:150]:
+    for market in universe:
         if is_excluded_coin(market):
             continue
             
@@ -1565,37 +1565,17 @@ def adjust_min_order_size(price, min_krw=7000, buffer=1.02):
     return math.ceil((min_krw * buffer) / price * 1e8) / 1e8
 
 def adjust_price_to_tick(price):
-    """
-    빗썸 원화 마켓 호가 단위(Tick Size) 적용
-    """
-    if price >= 2_000_000:
-        tick = 1000
-    elif price >= 1_000_000:
-        tick = 1000
-    elif price >= 500_000:
-        tick = 500
-    elif price >= 100_000:
-        tick = 100
-    elif price >= 50_000:
-        tick = 50
-    elif price >= 10_000:
-        tick = 10
-    elif price >= 5_000:
-        tick = 5
-    elif price >= 1_000:
-        tick = 1
-    elif price >= 100:
-        tick = 1
-    elif price >= 10:
-        tick = 0.01
+    """빗썸 호가 단위에 맞춰 가격 조정"""
+    if price < 100:
+        return round(price, 1)  # 0.1원 단위
+    elif price < 1000:
+        return round(price)  # 1원 단위
+    elif price < 10000:
+        return round(price / 5) * 5  # 5원 단위
+    elif price < 100000:
+        return round(price / 10) * 10  # 10원 단위
     else:
-        tick = 0.0001
-        
-    # 호가 단위에 맞춰 버림(Floor) 처리
-    if tick < 1:
-        return float(int(price / tick) * tick)
-    else:
-        return int(price // tick * tick)
+        return round(price / 100) * 100  # 100원 단위
     
 # ---------------------------
 # Market List
@@ -1805,7 +1785,7 @@ def run():
         log_print("[DATA] 캔들 수집...")
         collected = 0
         
-        for market in universe[:50]:
+        for market in universe:
             if is_excluded_coin(market):
                 continue
             
