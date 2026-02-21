@@ -1,103 +1,79 @@
+# ============================================================
+# claude_main.py — AI 전략 완전 제어 리팩토링 버전
+# ============================================================
+
 import time, json, sqlite3, math
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
+from typing import List
 import requests
 import pandas as pd
 import numpy as np
-import os
-import hmac
-import hashlib
-import base64
-import urllib.parse
-import jwt
+import os, hmac, hashlib, base64, urllib.parse, jwt
 from dotenv import load_dotenv
-import re
-import logging
-import smtplib
+import re, logging, smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-import threading
-import sys
-
-
+import threading, sys
 
 load_dotenv()
 
-# ---------------------------
-# 전역 변수 및 설정
-# ---------------------------
+# ============================================================
+# 로깅 설정
+# ============================================================
 current_log_file = None
 file_handler = None
 logger = logging.getLogger("TradingBot")
 logger.setLevel(logging.DEBUG)
-
-# 콘솔 핸들러는 한 번만 설정
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# ---------------------------
-# Gmail 설정
-# ---------------------------
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
 TARGET_EMAIL = os.getenv("TARGET_EMAIL")
-EMAIL_INTERVAL = 3 * 60 * 60  # 3시간
+EMAIL_INTERVAL = 3 * 60 * 60
 
 def get_new_log_filename():
-    """현재 시간 기준으로 새 로그 파일명 생성 (예: 2026_02_11_21_30.log)"""
+    """현재 시간 기준으로 새 로그 파일명 생성"""
     return datetime.now().strftime("%Y_%m_%d_%H_%M.log")
 
 def setup_logger():
     """새로운 로그 파일을 생성하고 핸들러를 교체함"""
     global current_log_file, file_handler, logger
-
-    # 새 파일명 생성
     new_log_file = get_new_log_filename()
-
-    # 기존 핸들러 제거
     if file_handler:
         logger.removeHandler(file_handler)
         file_handler.close()
-
-    # 새 핸들러 설정
     current_log_file = new_log_file
     file_handler = logging.FileHandler(current_log_file, encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-
     logger.info(f"새로운 로그 파일 생성됨: {current_log_file}")
     return new_log_file
 
 def send_email_and_rotate_log():
     """현재 로그 파일을 전송하고, 새로운 로그 파일로 교체"""
     global current_log_file, last_portfolio_value, last_email_time
-
     file_to_send = current_log_file
     if not file_to_send or not os.path.exists(file_to_send):
         logger.warning("전송할 로그 파일이 없습니다.")
         return
-
-    # 1) 포트폴리오
+    
     current_portfolio = get_total_portfolio_value()
     current_value = current_portfolio['total_krw']
-
-    # 2) 3시간 전 대비(=직전 이메일 대비)
+    
     if last_portfolio_value is None:
         last_portfolio_value = current_value
-
     diff_krw = current_value - last_portfolio_value
     diff_pct = (diff_krw / last_portfolio_value * 100) if last_portfolio_value > 0 else 0
-
-    # 3) 승률/성과
+    
     perf = analyze_trading_performance()
-
-    # 4) AI Config 변경 내역(meta에서 읽기)
     change_raw = db_get_meta("last_ai_config_change", None)
     change_text = "(기록 없음)"
     change_ts = None
@@ -108,54 +84,50 @@ def send_email_and_rotate_log():
             change_ts = obj.get("ts", None)
         except Exception:
             change_text = change_raw
-
-    # 5) 보유 코인 상세 문자열
+    
     coins_lines = []
     coins = current_portfolio.get("coins", {})
     if coins:
         for coin, info in sorted(coins.items(), key=lambda x: x[1]['value_krw'], reverse=True):
-            coins_lines.append(
-                f"- {coin}: {info['balance']:.6f}개, 평가 {info['value_krw']:,.0f}원 (@ {info['price']:,.0f})"
-            )
+            coins_lines.append(f" - {coin}: {info['balance']:.6f}개, 평가 {info['value_krw']:,.0f}원 (@ {info['price']:,.0f})")
     else:
-        coins_lines.append("- (보유 코인 없음)")
-
+        coins_lines.append(" - (보유 코인 없음)")
+    
     now = datetime.now()
     subject = f"Trading Bot : {now.strftime('%Y/%m/%d %H:%M')} (3시간 리포트)"
-
     change_time_str = ""
     if change_ts:
         change_time_str = datetime.fromtimestamp(change_ts).strftime("%Y/%m/%d %H:%M")
-
+    
     body = f"""
 === 트레이딩 봇 3시간 리포트 ===
 
 1) 3시간 전 대비 금액 증감
-- 현재 총 자산: {current_value:,.0f}원
-- 3시간 전(직전 리포트): {last_portfolio_value:,.0f}원
-- 증감: {diff_krw:+,.0f}원 ({diff_pct:+.2f}%)
+ - 현재 총 자산: {current_value:,.0f}원
+ - 3시간 전(직전 리포트): {last_portfolio_value:,.0f}원
+ - 증감: {diff_krw:+,.0f}원 ({diff_pct:+.2f}%)
 
 2) AI Config 변동 내역
-- 마지막 변경 시각: {change_time_str if change_time_str else "(알 수 없음)"}
+ - 마지막 변경 시각: {change_time_str if change_time_str else "(알 수 없음)"}
 {change_text}
 
 3) 승률 / 최근 100거래 성과
-- 총 거래 수: {perf['total_trades']}
-- 승률: {perf['win_rate']*100:.1f}%
-- 총 손익: {perf['total_pnl']:+,.0f}원
-- 평균 이익: {perf['avg_profit']:+,.0f}원
-- 평균 손실: {-perf['avg_loss']:,.0f}원
-- 총 수수료: {perf['total_fees']:,.0f}원
+ - 총 거래 수: {perf['total_trades']}
+ - 승률: {perf['win_rate']*100:.1f}%
+ - 총 손익: {perf['total_pnl']:+,.0f}원
+ - 평균 이익: {perf['avg_profit']:+,.0f}원
+ - 평균 손실: {-perf['avg_loss']:,.0f}원
+ - 총 수수료: {perf['total_fees']:,.0f}원
 
 4) 포트폴리오 구성 (보유코인 포함)
-- KRW 잔고: {current_portfolio['krw']:,.0f}원
-- 코인 평가액: {current_portfolio['total_coin_value']:,.0f}원
-- 보유 코인 수: {len(coins)}
+ - KRW 잔고: {current_portfolio['krw']:,.0f}원
+ - 코인 평가액: {current_portfolio['total_coin_value']:,.0f}원
+ - 보유 코인 수: {len(coins)}
 {chr(10).join(coins_lines)}
 
 (상세 로그는 첨부 파일 참고)
 """
-
+    
     try:
         if GMAIL_USER and GMAIL_PASSWORD:
             msg = MIMEMultipart()
@@ -163,31 +135,24 @@ def send_email_and_rotate_log():
             msg['To'] = TARGET_EMAIL
             msg['Subject'] = subject
             msg.attach(MIMEText(body, 'plain'))
-
             with open(file_to_send, 'rb') as f:
                 part = MIMEBase('application', 'octet-stream')
                 part.set_payload(f.read())
                 encoders.encode_base64(part)
                 part.add_header('Content-Disposition', f'attachment; filename={file_to_send}')
                 msg.attach(part)
-
             server = smtplib.SMTP('smtp.gmail.com', 587)
             server.starttls()
             server.login(GMAIL_USER, GMAIL_PASSWORD)
             server.send_message(msg)
             server.quit()
-
             logger.info(f"이메일 전송 성공: {file_to_send} -> {TARGET_EMAIL}")
-
-            # 직전 리포트 값 업데이트 (다음 리포트에서 '3시간 전 대비'로 사용)
             last_portfolio_value = current_value
             last_email_time = time.time()
         else:
             logger.warning("이메일 설정이 없어 전송을 건너뜁니다.")
-
     except Exception as e:
         logger.error(f"이메일 전송 중 오류 발생: {e}")
-
     setup_logger()
 
 def log_rotation_scheduler():
@@ -196,175 +161,339 @@ def log_rotation_scheduler():
         time.sleep(EMAIL_INTERVAL)
         send_email_and_rotate_log()
 
-# 초기 로거 설정
 setup_logger()
+last_portfolio_value = None
+last_email_time = 0
 
-# 백그라운드 스레드 시작 (메인 코드 실행 전 호출 필요)
-# threading.Thread(target=log_rotation_scheduler, daemon=True).start()
+# ============================================================
+# 설정 데이터클래스
+# ============================================================
 
-# ---------------------------
-# 전역 변수 추가
-# ---------------------------
-last_portfolio_value = None  # 이전 포트폴리오 가치
-last_email_time = 0  # 마지막 이메일 전송 시각
-
-# ---------------------------
-# Config / Parameters
-# ---------------------------
 @dataclass
 class Params:
-    max_positions: int = 5
-    max_coin_weight: float = 0.5
-    risk_per_trade: float = 0.08
-    position_allocation_pct: float = 0.7
-    atr_mult_stop: float = 2.5
+    """거래 전략 기본 파라미터"""
+    max_positions: int = 4
+    max_coin_weight: float = 0.6
+    risk_per_trade: float = 0.035
+    position_allocation_pct: float = 0.65
+    atr_mult_stop: float = 3.0
     breakout_lookback: int = 2
-    trend_ma_fast: int = 10
-    trend_ma_slow: int = 30
-    cooldown_minutes: int = 10
-    min_volume_mult: float = 0.7
-
+    trend_ma_fast: int = 20
+    trend_ma_slow: int = 50
+    cooldown_minutes: int = 90
+    min_volume_mult: float = 1.2
 
 @dataclass
 class StrategyConfig:
-    """AI가 수정 가능한 전략 설정"""
+    """전략 종료 조건 파라미터"""
     use_trend_filter: bool = True
-    use_volume_filter: bool = False
+    use_volume_filter: bool = True
     use_volatility_filter: bool = False
-    min_volume_mult: float = 0.8
-    volatility_mult: float = 0.8
-    trailing_stop_profit_threshold: float = 0.012
-    max_loss_per_trade: float = 0.025
+    min_volume_mult: float = 1.3
+    volatility_mult: float = 0.9
+    trailing_stop_profit_threshold: float = 0.018
+    max_loss_per_trade: float = 0.022
+    take_profit_pct: float = 0.040
+    time_stop_hours: float = 48.0
 
+@dataclass
+class SignalConfig:
+    """신호 생성 파라미터"""
+    # RSI
+    rsi_min: float = 30.0
+    rsi_max: float = 65.0
+    rsi_oversold: float = 35.0
+    rsi_overbought: float = 70.0
+    # 가격 포지션
+    price_pos_min: float = 0.2
+    price_pos_max: float = 0.4
+    price_pos_block: float = 0.8
+    price_pos_lookback: int = 10
+    # 추세
+    trend_strong_pct: float = 0.02
+    # 거래량
+    volume_confirm_mult: float = 0.9
+    volume_strong_mult: float = 1.5
+    # BB
+    bb_lower_touch_pct: float = 0.02
+    # 캔들 강도
+    candle_strength_mult: float = 0.5
+    big_candle_mult: float = 1.0
+    # ATR 손절 배수
+    atr_stop_p1: float = 1.5
+    atr_stop_p2: float = 1.2
+    atr_stop_p3: float = 1.0
+    atr_stop_p4: float = 1.0
+    atr_stop_p5: float = 1.0
+    # 손절 안전 마진
+    stop_margin_p1: float = 0.98
+    stop_margin_p2: float = 0.97
+    stop_margin_p3: float = 0.97
+    stop_margin_p4: float = 0.96
+    stop_margin_p5: float = 0.96
+    # 패턴 활성화
+    use_pattern_1: bool = True
+    use_pattern_2: bool = True
+    use_pattern_3: bool = True
+    use_pattern_4: bool = True
+    use_pattern_5: bool = True
+    # 패턴 우선순위
+    pattern_priority: List[int] = field(default_factory=lambda: [3, 1, 2, 4, 5])
+
+@dataclass
+class RiskConfig:
+    """리스크/주문 실행 파라미터"""
+    # 트레일링
+    trail_atr_mult: float = 2.0
+    pullback_exit_pct: float = 0.02
+    pullback_lookback: int = 10
+    # 쿨다운
+    cooldown_after_loss: int = 90
+    cooldown_after_win: int = 15
+    cooldown_default: int = 5
+    # 포지션 사이징
+    invest_capital_pct: float = 0.55
+    risk_multiplier: float = 8.0
+    # 주문 실행
+    order_wait_sec: int = 30
+    market_order_buffer: float = 1.1
+    available_krw_safety: float = 0.95
+    min_order_mult: float = 1.0
 
 @dataclass
 class Config:
-    db_path: str = os.getenv("DB_PATH")
+    """시스템 설정"""
+    db_path: str = os.getenv("DB_PATH", "trading_bot.db")
     ollama_url: str = os.getenv("OLLAMA_URL")
     ollama_model: str = os.getenv("OLLAMA_MODEL")
     quote: str = "KRW"
-    exclude: tuple = ("BTC", "ETH")  # AI 관리 대상에서 제외
-    universe_size: int = 200
+    exclude: tuple = ("BTC", "ETH")
+    universe_size: int = 300
     collect_interval_sec: int = 300
     ai_refresh_min: int = 30
-    fee_rate: float = 0  # 빗썸 수수료 0.25%
-    min_order_krw: float = 7000  # 최소 주문 금액
+    fee_rate: float = 0.0004
+    min_order_krw: float = 7000
 
+@dataclass
+class AIConfig:
+    """AI가 제어하는 모든 설정의 통합 컨테이너"""
+    params: Params = field(default_factory=Params)
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    signal: SignalConfig = field(default_factory=SignalConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    
+    def to_dict(self) -> dict:
+        return {
+            "params": asdict(self.params),
+            "strategy": asdict(self.strategy),
+            "signal": asdict(self.signal),
+            "risk": asdict(self.risk),
+        }
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "AIConfig":
+        cfg = cls()
+        def safe_set(obj, kv: dict):
+            for k, v in kv.items():
+                if hasattr(obj, k):
+                    try: 
+                        setattr(obj, k, v)
+                    except: 
+                        pass
+        if "params" in data: safe_set(cfg.params, data["params"])
+        if "strategy" in data: safe_set(cfg.strategy, data["strategy"])
+        if "signal" in data: safe_set(cfg.signal, data["signal"])
+        if "risk" in data: safe_set(cfg.risk, data["risk"])
+        return cfg
+    
+    @classmethod
+    def from_json(cls, json_str: str) -> "AIConfig":
+        return cls.from_dict(json.loads(json_str))
+    
+    def save_to_db(self):
+        db_set_meta("ai_config_v2", self.to_json())
+        logger.info("[AIConfig] 설정 DB 저장 완료")
+    
+    @classmethod
+    def load_from_db(cls) -> "AIConfig":
+        raw = db_get_meta("ai_config_v2")
+        if raw:
+            try:
+                cfg = cls.from_json(raw)
+                logger.info("[AIConfig] 설정 DB 로드 완료")
+                return cfg
+            except Exception as e:
+                logger.warning(f"[AIConfig] 로드 실패, 기본값 사용: {e}")
+        return cls()
 
 CFG = Config()
-PARAMS = Params()
-STRATEGY = StrategyConfig()
+AI_CFG = AIConfig()
 
-def log_print(*args, level="info", sep=" "):
-    # (선택) 과거 스타일: log_print("msg", "error")도 허용
-    if len(args) == 2 and isinstance(args[1], str) and args[1] in ("debug", "info", "warning", "error"):
-        msg, level2 = args
-        args = (msg,)
-        level = level2
+# ============================================================
+# AI Config 범위 검증 함수
+# ============================================================
 
-    msg = sep.join(str(a) for a in args)
+def validate_and_clamp_config(cfg: AIConfig) -> AIConfig:
+    """AI가 설정한 값의 범위 검증 및 자동 보정"""
+    p = cfg.params
+    s = cfg.strategy
+    sg = cfg.signal
+    r = cfg.risk
+    
+    # ── Params ──
+    p.risk_per_trade = max(0.010, min(0.080, p.risk_per_trade))
+    p.max_positions = max(1, min(5, int(p.max_positions)))
+    p.trend_ma_fast = max(5, min(30, int(p.trend_ma_fast)))
+    p.trend_ma_slow = max(30, min(120, int(p.trend_ma_slow)))
+    if p.trend_ma_fast >= p.trend_ma_slow:
+        p.trend_ma_slow = p.trend_ma_fast + 20
+    p.cooldown_minutes = max(15, min(240, int(p.cooldown_minutes)))
+    p.atr_mult_stop = max(1.0, min(5.0, p.atr_mult_stop))
+    
+    # ── StrategyConfig ──
+    s.max_loss_per_trade = max(0.008, min(0.050, s.max_loss_per_trade))
+    s.take_profit_pct = max(0.010, min(0.100, s.take_profit_pct))
+    if s.take_profit_pct <= s.max_loss_per_trade:
+        s.take_profit_pct = s.max_loss_per_trade * 1.6
+    s.time_stop_hours = max(6.0, min(120.0, s.time_stop_hours))
+    s.trailing_stop_profit_threshold = max(0.008, min(0.050, s.trailing_stop_profit_threshold))
+    s.min_volume_mult = max(0.5, min(3.0, s.min_volume_mult))
+    
+    # ── SignalConfig ──
+    sg.rsi_min = max(15.0, min(45.0, sg.rsi_min))
+    sg.rsi_max = max(50.0, min(80.0, sg.rsi_max))
+    sg.rsi_oversold = max(20.0, min(45.0, sg.rsi_oversold))
+    sg.rsi_overbought = max(60.0, min(85.0, sg.rsi_overbought))
+    if sg.rsi_min >= sg.rsi_max: 
+        sg.rsi_max = sg.rsi_min + 20
+    sg.price_pos_min = max(0.05, min(0.40, sg.price_pos_min))
+    sg.price_pos_max = max(sg.price_pos_min + 0.05, min(0.70, sg.price_pos_max))
+    sg.price_pos_block = max(0.60, min(0.98, sg.price_pos_block))
+    sg.price_pos_lookback = max(5, min(30, int(sg.price_pos_lookback)))
+    sg.trend_strong_pct = max(0.003, min(0.08, sg.trend_strong_pct))
+    sg.volume_confirm_mult = max(0.3, min(1.5, sg.volume_confirm_mult))
+    sg.volume_strong_mult = max(1.0, min(4.0, sg.volume_strong_mult))
+    sg.bb_lower_touch_pct = max(0.00, min(0.05, sg.bb_lower_touch_pct))
+    sg.candle_strength_mult = max(0.1, min(2.0, sg.candle_strength_mult))
+    sg.big_candle_mult = max(0.3, min(3.0, sg.big_candle_mult))
+    
+    for attr in ["atr_stop_p1", "atr_stop_p2", "atr_stop_p3", "atr_stop_p4", "atr_stop_p5"]:
+        setattr(sg, attr, max(0.3, min(4.0, getattr(sg, attr))))
+    for attr in ["stop_margin_p1", "stop_margin_p2", "stop_margin_p3", "stop_margin_p4", "stop_margin_p5"]:
+        setattr(sg, attr, max(0.90, min(0.99, getattr(sg, attr))))
+    
+    valid = set(range(1, 6))
+    if not (isinstance(sg.pattern_priority, list) and 
+            set(sg.pattern_priority) == valid and 
+            len(sg.pattern_priority) == 5):
+        sg.pattern_priority = [3, 1, 2, 4, 5]
+    
+    # ── RiskConfig ──
+    r.trail_atr_mult = max(1.0, min(5.0, r.trail_atr_mult))
+    r.pullback_exit_pct = max(0.005, min(0.08, r.pullback_exit_pct))
+    r.pullback_lookback = max(3, min(30, int(r.pullback_lookback)))
+    r.cooldown_after_loss = max(30, min(360, int(r.cooldown_after_loss)))
+    r.cooldown_after_win = max(5, min(120, int(r.cooldown_after_win)))
+    r.cooldown_default = max(1, min(30, int(r.cooldown_default)))
+    r.invest_capital_pct = max(0.20, min(0.90, r.invest_capital_pct))
+    r.risk_multiplier = max(2.0, min(20.0, r.risk_multiplier))
+    r.order_wait_sec = max(5, min(120, int(r.order_wait_sec)))
+    r.market_order_buffer = max(1.00, min(1.30, r.market_order_buffer))
+    r.available_krw_safety = max(0.70, min(0.99, r.available_krw_safety))
+    r.min_order_mult = max(0.5, min(5.0, r.min_order_mult))
+    
+    return cfg
 
-    if level == "debug":
-        logger.debug(msg)
-    elif level == "info":
-        logger.info(msg)
-    elif level == "warning":
-        logger.warning(msg)
-    elif level == "error":
-        logger.error(msg)
-    else:
-        logger.info(msg)
+# ============================================================
+# DB 함수들
+# ============================================================
 
-# ---------------------------
-# DB
-# ---------------------------
 def init_db():
     con = sqlite3.connect(CFG.db_path)
     cur = con.cursor()
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS candles (
-      ts INTEGER,
-      market TEXT,
-      timeframe TEXT,
-      open REAL, high REAL, low REAL, close REAL,
-      volume REAL,
-      trade_value REAL,
-      PRIMARY KEY (ts, market, timeframe)
-    )
+        CREATE TABLE IF NOT EXISTS candles (
+            ts INTEGER,
+            market TEXT,
+            timeframe TEXT,
+            open REAL, high REAL, low REAL, close REAL,
+            volume REAL,
+            trade_value REAL,
+            PRIMARY KEY (ts, market, timeframe)
+        )
     """)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS meta (
-      k TEXT PRIMARY KEY,
-      v TEXT
-    )
+        CREATE TABLE IF NOT EXISTS meta (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        )
     """)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS positions (
-      market TEXT PRIMARY KEY,
-      entry_price REAL,
-      entry_time INTEGER,
-      size REAL,
-      stop_loss REAL,
-      direction TEXT,
-      entry_fee REAL
-    )
+        CREATE TABLE IF NOT EXISTS positions (
+            market TEXT PRIMARY KEY,
+            entry_price REAL,
+            entry_time INTEGER,
+            size REAL,
+            stop_loss REAL,
+            direction TEXT,
+            entry_fee REAL
+        )
     """)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS trades (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      market TEXT,
-      direction TEXT,
-      entry_price REAL,
-      exit_price REAL,
-      size REAL,
-      entry_time INTEGER,
-      exit_time INTEGER,
-      pnl REAL,
-      total_fee REAL,
-      holding_hours REAL,
-      exit_reason TEXT
-    )
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market TEXT,
+            direction TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            size REAL,
+            entry_time INTEGER,
+            exit_time INTEGER,
+            pnl REAL,
+            total_fee REAL,
+            holding_hours REAL,
+            exit_reason TEXT
+        )
     """)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS ai_learning (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp INTEGER,
-      win_rate REAL,
-      avg_profit REAL,
-      avg_loss REAL,
-      total_trades INTEGER,
-      params_json TEXT,
-      strategy_json TEXT,
-      performance_score REAL
-    )
+        CREATE TABLE IF NOT EXISTS ai_learning (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER,
+            win_rate REAL,
+            avg_profit REAL,
+            avg_loss REAL,
+            total_trades INTEGER,
+            params_json TEXT,
+            strategy_json TEXT,
+            performance_score REAL
+        )
     """)
     con.commit()
     con.close()
-
 
 def db_put_candles(rows):
     con = sqlite3.connect(CFG.db_path)
     cur = con.cursor()
     cur.executemany("""
-      INSERT OR REPLACE INTO candles
-      (ts, market, timeframe, open, high, low, close, volume, trade_value)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO candles
+        (ts, market, timeframe, open, high, low, close, volume, trade_value)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
     con.commit()
     con.close()
 
-
-def db_get_candles(market, timeframe, limit=200):
-    """특정 마켓의 캔들 데이터 조회"""
+def db_get_candles(market, timeframe, limit=300):
     con = sqlite3.connect(CFG.db_path)
     df = pd.read_sql_query("""
-        SELECT * FROM candles 
+        SELECT * FROM candles
         WHERE market=? AND timeframe=?
         ORDER BY ts DESC LIMIT ?
     """, con, params=(market, timeframe, limit))
     con.close()
     return df.sort_values('ts').reset_index(drop=True) if not df.empty else df
-
 
 def db_set_meta(k, v):
     con = sqlite3.connect(CFG.db_path)
@@ -374,7 +503,6 @@ def db_set_meta(k, v):
     con.close()
 
 def save_ai_change_summary(changes_text: str):
-    """최근 AI 설정 변경 내역을 meta에 저장"""
     if not changes_text:
         changes_text = "(변경 없음)"
     payload = {
@@ -391,99 +519,67 @@ def db_get_meta(k, default=None):
     con.close()
     return r[0] if r else default
 
-
 def db_get_positions():
-    """현재 포지션 조회"""
     con = sqlite3.connect(CFG.db_path)
     df = pd.read_sql_query("SELECT * FROM positions", con)
     con.close()
     return df
 
-
 def db_add_position(market, entry_price, size, stop_loss, direction, entry_fee):
-    """포지션 추가"""
     con = sqlite3.connect(CFG.db_path)
     cur = con.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO positions 
+        INSERT OR REPLACE INTO positions
         (market, entry_price, entry_time, size, stop_loss, direction, entry_fee)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (market, entry_price, int(time.time()), size, stop_loss, direction, entry_fee))
     con.commit()
     con.close()
 
-
 def db_remove_position(market):
-    """포지션 제거"""
     con = sqlite3.connect(CFG.db_path)
     cur = con.cursor()
     cur.execute("DELETE FROM positions WHERE market=?", (market,))
     con.commit()
     con.close()
 
-
 def db_get_recent_trades(limit=100):
-    """최근 거래 내역 조회"""
     con = sqlite3.connect(CFG.db_path)
     df = pd.read_sql_query("""
-        SELECT * FROM trades 
-        ORDER BY exit_time DESC 
+        SELECT * FROM trades
+        ORDER BY exit_time DESC
         LIMIT ?
     """, con, params=(limit,))
     con.close()
     return df
 
-
-def db_save_ai_learning(win_rate, avg_profit, avg_loss, total_trades, params_json, strategy_json, performance_score):
-    """AI 학습 결과 저장"""
-    con = sqlite3.connect(CFG.db_path)
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO ai_learning 
-        (timestamp, win_rate, avg_profit, avg_loss, total_trades, params_json, strategy_json, performance_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (int(time.time()), win_rate, avg_profit, avg_loss, total_trades, params_json, strategy_json, performance_score))
-    con.commit()
-    con.close()
-
-
-def db_get_ai_learning_history(limit=10):
-    """AI 학습 히스토리 조회"""
+def db_get_recent_trades_by_market(market, limit=5):
     con = sqlite3.connect(CFG.db_path)
     df = pd.read_sql_query("""
-        SELECT * FROM ai_learning 
-        ORDER BY timestamp DESC 
+        SELECT * FROM trades
+        WHERE market=?
+        ORDER BY exit_time DESC
         LIMIT ?
-    """, con, params=(limit,))
+    """, con, params=(market, limit))
     con.close()
     return df
 
+# ============================================================
+# 유틸리티 함수들
+# ============================================================
 
-# ---------------------------
-# 유틸리티
-# ---------------------------
 def is_excluded_coin(market):
-    """해당 마켓이 제외 대상인지 확인 및 유효성 검사"""
     if not market or '-' not in market:
-        return True # 잘못된 형식은 제외
-    
+        return True
     _, currency = market.split('-')
-    
-    # 1. 사용자 설정 제외 리스트 체크
     if currency.upper() in [x.upper() for x in CFG.exclude]:
         return True
-    
-    # 2. 티커 길이 체크 (일반적인 코인은 2~5자 이상)
     if len(currency) < 2:
         return True
-        
     return False
 
-
 def analyze_trading_performance():
-    """거래 성과 분석"""
     trades = db_get_recent_trades(limit=100)
-    
     if trades.empty:
         return {
             "total_trades": 0,
@@ -500,18 +596,13 @@ def analyze_trading_performance():
     
     winning_trades = trades[trades['pnl'] > 0]
     losing_trades = trades[trades['pnl'] <= 0]
-    
     total_trades = len(trades)
     win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0
-    
     avg_profit = winning_trades['pnl'].mean() if not winning_trades.empty else 0
     avg_loss = abs(losing_trades['pnl'].mean()) if not losing_trades.empty else 0
-    
     total_profit = winning_trades['pnl'].sum() if not winning_trades.empty else 0
     total_loss = abs(losing_trades['pnl'].sum()) if not losing_trades.empty else 0
-    
     profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
-    
     avg_holding_hours = trades['holding_hours'].mean() if 'holding_hours' in trades.columns else 0
     
     return {
@@ -527,25 +618,20 @@ def analyze_trading_performance():
         "total_fees": trades['total_fee'].sum()
     }
 
+# ============================================================
+# Bithumb API
+# ============================================================
 
-# ---------------------------
-# Bithumb API 2.0 - Private API
-# ---------------------------
 class BithumbPrivateAPI:
-    """빗썸 Private API 2.0 클래스"""
-    
     def __init__(self):
         self.api_url = "https://api.bithumb.com"
         self.api_key = os.getenv("BITHUMB_API_KEY")
         self.api_secret = os.getenv("BITHUMB_SECRET_KEY")
-        
         if not self.api_key or not self.api_secret:
             raise ValueError("[ERROR] 환경변수에 BITHUMB_API_KEY와 BITHUMB_SECRET_KEY를 설정해주세요")
-        
         self.sess = requests.Session()
     
     def _create_jwt_token(self, query_params=None):
-        """JWT 토큰 생성 (API 2.0)"""
         import uuid
         payload = {
             'access_key': self.api_key,
@@ -557,28 +643,14 @@ class BithumbPrivateAPI:
             query_hash = hashlib.sha512(query_string).hexdigest()
             payload['query_hash'] = query_hash
             payload['query_hash_alg'] = 'SHA512'
-
         token = jwt.encode(payload, self.api_secret, algorithm='HS256')
-
-        # pyjwt 버전 차이: bytes면 decode
         if isinstance(token, bytes):
             token = token.decode('utf-8')
-
         return f'Bearer {token}'
     
     def _api_call(self, method, endpoint, params=None, is_query=False):
-        """
-        API 2.0 호출
-        
-        Args:
-            method: GET, POST 등
-            endpoint: API 엔드포인트
-            params: 파라미터
-            is_query: True면 쿼리 파라미터, False면 body 파라미터
-        """
         try:
             url = self.api_url + endpoint
-            
             if is_query and params:
                 authorization = self._create_jwt_token(params)
                 headers = {
@@ -598,230 +670,161 @@ class BithumbPrivateAPI:
                 response.raise_for_status()
                 result = response.json()
             except requests.HTTPError as e:
-                log_print("[ERROR] HTTP", response.status_code, response.text)
+                logger.error(f"[ERROR] HTTP {response.status_code} {response.text}")
                 raise
             
-            # API 2.0 에러 체크
             if 'error' in result:
-                log_print(f"[ERROR] API 에러: {result['error']['message']}")
+                logger.error(f"[ERROR] API 에러: {result['error']['message']}")
                 return None
-            
             return result
-        
         except requests.exceptions.Timeout:
-            log_print(f"[ERROR] API 타임아웃: {endpoint}")
+            logger.error(f"[ERROR] API 타임아웃: {endpoint}")
             return None
         except requests.exceptions.RequestException as e:
-            log_print(f"[ERROR] API 요청 실패: {e}")
+            logger.error(f"[ERROR] API 요청 실패: {e}")
             return None
         except Exception as e:
-            log_print(f"[ERROR] 예상치 못한 오류: {e}")
+            logger.error(f"[ERROR] 예상치 못한 오류: {e}")
             return None
     
     def get_accounts(self):
-        """전체 계좌 조회 (API 2.0)"""
         endpoint = "/v1/accounts"
         return self._api_call("GET", endpoint)
     
     def get_order_chance(self, market):
-        """
-        주문 가능 정보 조회 (API 2.0)
-        - 최소 주문 금액
-        - 주문 가능 여부
-        - 수수료 등
-        """
         endpoint = "/v1/orders/chance"
         params = {"market": market}
         return self._api_call("GET", endpoint, params, is_query=True)
     
     def place_order(self, market, side, volume=None, price=None, ord_type="limit"):
-        """
-        주문하기 (API 2.0)
-        
-        Args:
-            market: 마켓 ID (예: KRW-BTC)
-            side: 'bid' (매수) or 'ask' (매도)
-            volume: 주문량
-            price: 주문 가격 (지정가 주문 시)
-            ord_type: 'limit' (지정가) or 'price' (시장가 매수) or 'market' (시장가 매도)
-        """
         endpoint = "/v1/orders"
         params = {
             "market": market,
             "side": side,
             "ord_type": ord_type
         }
-        
         if volume:
             params["volume"] = str(volume)
         if price:
             params["price"] = str(price)
-        
         return self._api_call("POST", endpoint, params)
     
     def cancel_order(self, uuid):
-        """주문 취소 (API 2.0)"""
         endpoint = "/v1/order"
         params = {"uuid": uuid}
         return self._api_call("DELETE", endpoint, params, is_query=True)
     
     def get_order(self, uuid):
-        """개별 주문 조회 (API 2.0)"""
         endpoint = "/v1/order"
         params = {"uuid": uuid}
         return self._api_call("GET", endpoint, params, is_query=True)
 
-
-# ---------------------------
-# Bithumb API 2.0 - Public API
-# ---------------------------
 class BithumbPublic:
-    """빗썸 Public API 2.0 클래스"""
-    
     def __init__(self):
         self.sess = requests.Session()
         self.base_url = "https://api.bithumb.com"
     
     def get_markets(self):
-        """전체 마켓 코드 조회 (API 2.0)"""
         url = f"{self.base_url}/v1/market/all"
-        
         try:
             resp = self.sess.get(url, timeout=10)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            log_print(f"[ERROR] 마켓 코드 조회 실패: {e}")
+            logger.error(f"[ERROR] 마켓 코드 조회 실패: {e}")
             return []
     
-    def get_day_candles(self, market: str, count: int = 200, to: str = None):
-        """
-        일봉 캔들 조회 (API 2.0)
-        
-        Args:
-            market: 마켓 코드 (예: KRW-BTC)
-            count: 캔들 개수 (최대 200)
-            to: 마지막 캔들 시각 (ISO 8601 형식, 예: 2023-01-01T00:00:00Z)
-        """
+    def get_day_candles(self, market: str, count: int = 300, to: str = None):
         url = f"{self.base_url}/v1/candles/minutes/30"
         params = {
             "market": market,
-            "count": min(count, 200)
+            "count": min(count, 300)
         }
-        
         if to:
             params["to"] = to
-        
         try:
             resp = self.sess.get(url, params=params, timeout=10)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            log_print(f"[ERROR] {market} 캔들 조회 실패: {e}")
+            logger.error(f"[ERROR] {market} 캔들 조회 실패: {e}")
             return []
     
     def get_current_price(self, market: str):
-        """현재가 조회 (API 2.0 - ticker)"""
         if is_excluded_coin(market):
             return None
-        
         url = f"{self.base_url}/v1/ticker"
         params = {"markets": market}
-        
         try:
             resp = self.sess.get(url, params=params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-            
             if data and len(data) > 0:
                 return float(data[0]['trade_price'])
             return None
         except Exception as e:
-            log_print(f"[ERROR] {market} 현재가 조회 실패: {e}")
+            logger.error(f"[ERROR] {market} 현재가 조회 실패: {e}")
             return None
 
+# ============================================================
+# 수수료 및 잔고 함수
+# ============================================================
 
-# ---------------------------
-# 수수료 계산
-# ---------------------------
 def calculate_buy_fee_and_total(price, size):
-    """매수 시 필요한 총 금액 계산"""
     amount = price * size
     fee = amount * CFG.fee_rate
     total = amount + fee
-    
     return {
         "amount": amount,
         "fee": fee,
         "total": total
     }
 
-
 def calculate_sell_fee_and_net(price, size):
-    """매도 시 실제 받을 금액 계산"""
     amount = price * size
     fee = amount * CFG.fee_rate
     net = amount - fee
-    
     return {
         "amount": amount,
         "fee": fee,
         "net": net
     }
 
-
-# ---------------------------
-# 잔고 조회
-# ---------------------------
 def get_available_krw_balance():
-    """사용 가능한 KRW 잔고 조회 (API 2.0)"""
     try:
         api = BithumbPrivateAPI()
         result = api.get_accounts()
-        
         if result:
             for account in result:
                 if account['currency'] == 'KRW':
                     return float(account['balance'])
         return 0
     except Exception as e:
-        log_print(f"[ERROR] KRW 잔고 조회 실패: {e}")
+        logger.error(f"[ERROR] KRW 잔고 조회 실패: {e}")
         return 0
-
 
 def get_coin_balance(market):
-    """특정 코인 잔고 조회 (API 2.0)"""
     if is_excluded_coin(market):
         return 0
-    
     try:
         api = BithumbPrivateAPI()
         result = api.get_accounts()
-        
         currency = market.split('-')[1]
-        
         if result:
             for account in result:
                 if account['currency'].upper() == currency.upper():
                     return float(account['balance'])
         return 0
     except Exception as e:
-        log_print(f"[ERROR] {market} 잔고 조회 실패: {e}")
+        logger.error(f"[ERROR] {market} 잔고 조회 실패: {e}")
         return 0
 
-
-# ---------------------------
-# 포트폴리오 가치 계산
-# ---------------------------
 def get_total_portfolio_value(exclude_coins=None):
-    """AI 관리 자산의 포트폴리오 가치 계산"""
     if exclude_coins is None:
         exclude_coins = CFG.exclude
-    
     try:
         api = BithumbPrivateAPI()
         pub = BithumbPublic()
-        
         accounts = api.get_accounts()
         if not accounts:
             return {"krw": 0, "coins": {}, "total_coin_value": 0, "total_krw": 0}
@@ -833,19 +836,14 @@ def get_total_portfolio_value(exclude_coins=None):
         for account in accounts:
             currency = account['currency']
             balance = float(account['balance'])
-            
             if currency == 'KRW':
                 krw_balance = balance
                 continue
-            
-            # 제외 코인 스킵
             if currency.upper() in [x.upper() for x in exclude_coins]:
                 continue
-            
             if balance > 0:
                 market = f"KRW-{currency}"
                 current_price = pub.get_current_price(market)
-                
                 if current_price:
                     value_krw = balance * current_price
                     coins_value[currency] = {
@@ -856,1113 +854,684 @@ def get_total_portfolio_value(exclude_coins=None):
                     total_coin_value += value_krw
         
         total_value = krw_balance + total_coin_value
-        
         return {
             "krw": krw_balance,
             "coins": coins_value,
             "total_coin_value": total_coin_value,
             "total_krw": total_value
         }
-    
     except Exception as e:
-        log_print(f"[ERROR] 포트폴리오 가치 계산 실패: {e}")
+        logger.error(f"[ERROR] 포트폴리오 가치 계산 실패: {e}")
         return {"krw": 0, "coins": {}, "total_coin_value": 0, "total_krw": 0}
 
-
 def print_portfolio_summary():
-    """AI 관리 자산 포트폴리오 요약"""
     portfolio = get_total_portfolio_value()
-    
-    log_print(f"{'='*60}")
-    log_print(f"[PORTFOLIO] AI 관리 자산 요약")
-    log_print(f"  (BTC, ETH 등 수동 투자 자산 제외)")
-    log_print(f"{'='*60}")
-    log_print(f"KRW 잔고: {portfolio['krw']:,.0f}원")
-    log_print(f"코인 평가액: {portfolio['total_coin_value']:,.0f}원")
-    log_print(f"총 자산: {portfolio['total_krw']:,.0f}원")
-    
+    logger.info(f"{'='*60}")
+    logger.info(f"[PORTFOLIO] AI 관리 자산 요약")
+    logger.info(f" (BTC, ETH 등 수동 투자 자산 제외)")
+    logger.info(f"{'='*60}")
+    logger.info(f"KRW 잔고: {portfolio['krw']:,.0f}원")
+    logger.info(f"코인 평가액: {portfolio['total_coin_value']:,.0f}원")
+    logger.info(f"총 자산: {portfolio['total_krw']:,.0f}원")
     if portfolio['coins']:
-        log_print(f"AI 관리 코인 ({len(portfolio['coins'])}개):")
+        logger.info(f"AI 관리 코인 ({len(portfolio['coins'])}개):")
         for coin, info in sorted(portfolio['coins'].items(), 
                                 key=lambda x: x[1]['value_krw'], 
                                 reverse=True):
-            log_print(f"  - {coin}: {info['balance']:.6f} "
-                  f"= {info['value_krw']:,.0f}원 (@ {info['price']:,.0f})")
-    
-    log_print(f"{'='*60}\n")
+            logger.info(f" - {coin}: {info['balance']:.6f} "
+                       f"= {info['value_krw']:,.0f}원 (@ {info['price']:,.0f})")
+    logger.info(f"{'='*60}\n")
 
+# ============================================================
+# 기술적 지표
+# ============================================================
 
-# ---------------------------
-# 캔들 데이터 변환
-# ---------------------------
+def calculate_atr(df, period=14):
+    if len(df) < period + 1:
+        return pd.Series([0] * len(df))
+    high = df['high']
+    low = df['low']
+    close = df['close'].shift(1)
+    tr1 = high - low
+    tr2 = abs(high - close)
+    tr3 = abs(low - close)
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    return atr.fillna(0)
+
+def calculate_ma(df, period):
+    if len(df) < period:
+        return pd.Series([0] * len(df))
+    return df['close'].rolling(period).mean().fillna(0)
+
 def parse_candles_to_rows(candles_data, market, timeframe="30m"):
-    """API 2.0 캔들 응답을 DB 저장용 rows로 변환"""
     rows = []
-    
     for candle in candles_data:
         try:
-            # API 2.0 응답 구조
             ts = candle.get("timestamp", 0) // 1000
-            
             o = float(candle.get("opening_price", 0))
             h = float(candle.get("high_price", 0))
             l = float(candle.get("low_price", 0))
             c = float(candle.get("trade_price", 0))
             v = float(candle.get("candle_acc_trade_volume", 0))
             tv = float(candle.get("candle_acc_trade_price", 0))
-            
             rows.append((ts, market, timeframe, o, h, l, c, v, tv))
-        
         except (ValueError, TypeError, KeyError):
             continue
-    
     return rows
 
+def collect_candles(markets):
+    pub = BithumbPublic()
+    for market in markets:
+        if is_excluded_coin(market):
+            continue
+        try:
+            candles = pub.get_day_candles(market, count=300)
+            if candles:
+                rows = parse_candles_to_rows(candles, market, "30m")
+                if rows:
+                    db_put_candles(rows)
+        except Exception as e:
+            logger.error(f"[ERROR] {market} 캔들 수집 실패: {e}")
+        time.sleep(0.1)
 
-# ---------------------------
-# 기술적 지표 계산
-# ---------------------------
-def calculate_atr(df, period=14):
-    """ATR (Average True Range) 계산"""
-    if len(df) < period + 1:
-        return pd.Series([0] * len(df))
-    
-    high = df['high']
-    low = df['low']
-    close = df['close'].shift(1)
-    
-    tr1 = high - low
-    tr2 = abs(high - close)
-    tr3 = abs(low - close)
-    
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-    
-    return atr.fillna(0)
+# ============================================================
+# 신호 생성 (SignalConfig 적용)
+# ============================================================
 
-
-def calculate_ma(df, period):
-    """이동평균 계산"""
-    if len(df) < period:
-        return pd.Series([0] * len(df))
-    return df['close'].rolling(period).mean().fillna(0)
-
-
-def calculate_swing_high_low(df, lookback):
-    """스윙 고점/저점 계산"""
-    if len(df) < lookback:
-        return pd.Series([0] * len(df)), pd.Series([0] * len(df))
-    
-    swing_high = df['high'].rolling(lookback).max()
-    swing_low = df['low'].rolling(lookback).min()
-    
-    return swing_high.fillna(0), swing_low.fillna(0)
-
-
-# ---------------------------
-# 스윙 전략 시그널 생성
-# ---------------------------
-def generate_swing_signals(market, params: Params, strategy: StrategyConfig):
-    """스윙 트레이딩 시그널 생성"""
+def generate_swing_signals(market, params: Params, strategy: StrategyConfig, sig_cfg: SignalConfig) -> dict:
+    """스윙 트레이딩 신호 생성"""
     if is_excluded_coin(market):
         return {"signal": "hold", "reason": "excluded_coin"}
     
-    df = db_get_candles(market, "30m", limit=200)
+    df = db_get_candles(market, "30m", limit=300)
     if len(df) < max(params.trend_ma_slow, params.breakout_lookback) + 5:
         return {"signal": "hold", "reason": "insufficient_data"}
     
     # 지표 계산
-    df['atr'] = calculate_atr(df, 14)
-    df['ma_fast'] = calculate_ma(df, params.trend_ma_fast)
-    df['ma_slow'] = calculate_ma(df, params.trend_ma_slow)
-    df['swing_high'], df['swing_low'] = calculate_swing_high_low(df, params.breakout_lookback)
-    df['volume_ma'] = df['volume'].rolling(20).mean()
-    
-    # RSI 추가 (과매도 구간 탐지)
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    df["atr"] = calculate_atr(df, 14)
+    df["ma_fast"] = calculate_ma(df, params.trend_ma_fast)
+    df["ma_slow"] = calculate_ma(df, params.trend_ma_slow)
+    df["volume_ma"] = df["volume"].rolling(20).mean()
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+    df["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
+    df["bb_mid"] = df["close"].rolling(20).mean()
+    bb_std = df["close"].rolling(20).std()
+    df["bb_upper"] = df["bb_mid"] + bb_std * 2
+    df["bb_lower"] = df["bb_mid"] - bb_std * 2
     
+    lb = sig_cfg.price_pos_lookback
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    current_price = last['close']
-    atr = last['atr']
+    prev2 = df.iloc[-3]
+    current_price = last["close"]
+    atr = last["atr"]
+    ma_fast = last["ma_fast"]
+    ma_slow = last["ma_slow"]
+    rsi = last["rsi"]
     
-    # ===== 완화된 진입 조건 =====
+    if current_price is None or current_price <= 0 or atr <= 0 or pd.isna(atr):
+        return {"signal": "hold", "reason": "invalid_data"}
     
-    # 1) 추세 조건 완화: MA 교차 임박 or 정배열
-    trend_up = (
-        last['ma_fast'] > last['ma_slow'] or  # 기존 조건
-        (last['ma_fast'] > prev['ma_fast'] and last['close'] > last['ma_fast'])  # 상승 추세 시작
-    ) if strategy.use_trend_filter else True
+    # 공통 지표
+    trend_up = ma_fast > ma_slow
+    trend_strong = ma_fast > ma_slow * (1 + sig_cfg.trend_strong_pct)
+    recent_high = df["high"].tail(lb).max()
+    recent_low = df["low"].tail(lb).min()
+    price_range = recent_high - recent_low
+    price_pos = (current_price - recent_low) / price_range if price_range > 0 else 0.5
     
-    # 2) 브레이크아웃 조건 완화
-    # 기존: 6봉 고점 돌파 (너무 엄격)
-    # 개선: 3~4봉 고점 근접 or 직전 고점 돌파
-    recent_high_3 = df['high'].tail(3).max()  # 최근 3봉 고점
-    recent_high_4 = df['high'].tail(4).max()  # 최근 4봉 고점
+    rsi_ok = sig_cfg.rsi_min < rsi < sig_cfg.rsi_max
+    rsi_os = rsi < sig_cfg.rsi_oversold
     
-    breakout_up = (
-        last['high'] > df['swing_high'].iloc[-2] or  # 기존 조건 유지
-        current_price > recent_high_3 * 0.998 or  # 3봉 고점 근접 (0.2% 이내)
-        (current_price > prev['high'] and last['close'] > last['open'])  # 직전 고점 돌파 + 양봉
-    )
+    vol_ok = last["volume"] > last["volume_ma"] * sig_cfg.volume_confirm_mult
+    vol_strong = last["volume"] > last["volume_ma"] * sig_cfg.volume_strong_mult
     
-    # 3) 거래량 조건 완화
-    volume_confirm = (
-        last['volume'] > (last['volume_ma'] * strategy.min_volume_mult * 0.8)  # 80%로 완화
-    ) if strategy.use_volume_filter else True
+    bb_lo_touch = current_price <= last["bb_lower"] * (1 + sig_cfg.bb_lower_touch_pct)
+    bb_mid_abv = current_price > last["bb_mid"]
     
-    # 4) 변동성 필터는 선택적으로만
-    atr_avg = df['atr'].tail(20).mean()
-    volatility_ok = (atr > atr_avg * strategy.volatility_mult * 0.7) if strategy.use_volatility_filter else True
+    # 진입 금지 조건
+    if price_pos > sig_cfg.price_pos_block:
+        return {"signal": "hold", "reason": "price_too_high"}
+    if rsi > sig_cfg.rsi_overbought:
+        return {"signal": "hold", "reason": "rsi_overbought"}
+    if not trend_up:
+        return {"signal": "hold", "reason": "downtrend"}
+    if not vol_ok:
+        return {"signal": "hold", "reason": "low_volume"}
     
-    # 5) RSI 과매도 조건 추가 (선택적 진입)
-    rsi = last['rsi']
-    rsi_oversold = rsi < 35  # RSI 35 이하면 과매도
-    rsi_buy = 30 < rsi < 50  # RSI 30~50 구간에서 매수
-    
-    # ===== 매수 시그널 (다양한 진입 패턴) =====
-    
-    # 패턴 1: 기존 브레이크아웃
-    if trend_up and breakout_up and volume_confirm and volatility_ok:
-        stop_loss = current_price - (atr * params.atr_mult_stop)
-        return {
-            "signal": "buy",
-            "price": current_price,
-            "stop": stop_loss,
-            "atr": atr,
-            "reason": "breakout_up"
-        }
-    
-    # 패턴 2: RSI 과매도 반등 (추가)
-    if rsi_oversold and last['close'] > last['open'] and last['volume'] > last['volume_ma'] * 1.2:
-        stop_loss = current_price - (atr * 2.5)  # 더 타이트한 손절
-        return {
-            "signal": "buy",
-            "price": current_price,
-            "stop": stop_loss,
-            "atr": atr,
-            "reason": "rsi_oversold_bounce"
-        }
-    
-    # 패턴 3: 이평선 지지 반등 (추가)
-    ma_support = (
-        last['low'] <= last['ma_fast'] <= last['high'] and  # MA가 봉 내부
-        last['close'] > last['ma_fast'] and  # 종가는 MA 위
-        last['close'] > last['open']  # 양봉
-    )
-    if ma_support and rsi_buy and volume_confirm:
-        stop_loss = last['ma_fast'] - (atr * 1.5)  # MA 아래 손절
-        return {
-            "signal": "buy",
-            "price": current_price,
-            "stop": stop_loss,
-            "atr": atr,
-            "reason": "ma_support"
-        }
-    
-    # 패턴 4: 단순 상승 모멘텀 (가장 완화된 조건)
-    momentum_up = (
-        last['close'] > prev['close'] and
-        last['close'] > last['open'] and
-        last['volume'] > last['volume_ma'] * 0.9 and
-        rsi_buy
-    )
-    if momentum_up and not strategy.use_trend_filter:  # 필터 꺼져있을 때만
-        stop_loss = current_price - (atr * 2.0)
-        return {
-            "signal": "buy",
-            "price": current_price,
-            "stop": stop_loss,
-            "atr": atr,
-            "reason": "momentum"
-        }
+    # 패턴 체크
+    for pat_id in sig_cfg.pattern_priority:
+        # Pattern 1: MA Support Bounce
+        if pat_id == 1 and sig_cfg.use_pattern_1:
+            if trend_up and not trend_strong:
+                ma_touch = (
+                    prev["low"] <= prev["ma_fast"] <= prev["high"] and
+                    last["close"] > last["ma_fast"] and
+                    last["close"] > last["open"]
+                )
+                if ma_touch and rsi_ok and vol_ok:
+                    sl = ma_fast - atr * sig_cfg.atr_stop_p1
+                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p1:
+                        return {"signal": "buy", "price": float(current_price),
+                               "stop": float(sl), "atr": float(atr),
+                               "reason": "ma_support_bounce", "confidence": 0.9}
+        
+        # Pattern 2: Oversold Reversal
+        elif pat_id == 2 and sig_cfg.use_pattern_2:
+            if trend_up and rsi_os and bb_lo_touch:
+                strong_candle = (last["close"] - last["open"]) > atr * sig_cfg.candle_strength_mult
+                if strong_candle and vol_strong:
+                    sl = last["low"] - atr * sig_cfg.atr_stop_p2
+                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p2:
+                        return {"signal": "buy", "price": float(current_price),
+                               "stop": float(sl), "atr": float(atr),
+                               "reason": "oversold_reversal", "confidence": 0.85}
+        
+        # Pattern 3: Trend Dip Buy
+        elif pat_id == 3 and sig_cfg.use_pattern_3:
+            if (trend_up and
+                sig_cfg.price_pos_min <= price_pos <= sig_cfg.price_pos_max and
+                rsi_ok and last["close"] > last["open"] and vol_ok):
+                sl = recent_low - atr * sig_cfg.atr_stop_p3
+                if sl > 0 and sl < current_price * sig_cfg.stop_margin_p3:
+                    return {"signal": "buy", "price": float(current_price),
+                           "stop": float(sl), "atr": float(atr),
+                           "reason": "trend_dip_buy", "confidence": 0.95}
+        
+        # Pattern 4: Golden Cross
+        elif pat_id == 4 and sig_cfg.use_pattern_4:
+            ma_cross = (
+                ma_fast > ma_slow and
+                prev["ma_fast"] <= prev["ma_slow"] and
+                last["close"] > last["ma_fast"]
+            )
+            if ma_cross and rsi_ok and bb_mid_abv and vol_strong:
+                sl = ma_slow - atr * sig_cfg.atr_stop_p4
+                if sl > 0 and sl < current_price * sig_cfg.stop_margin_p4:
+                    return {"signal": "buy", "price": float(current_price),
+                           "stop": float(sl), "atr": float(atr),
+                           "reason": "golden_cross", "confidence": 0.8}
+        
+        # Pattern 5: V Reversal
+        elif pat_id == 5 and sig_cfg.use_pattern_5:
+            if len(df) >= 5:
+                three_down = (
+                    prev["close"] < prev2["close"] and
+                    prev2["close"] < df.iloc[-4]["close"] and
+                    prev["close"] < prev["open"]
+                )
+                big_green = (last["close"] - last["open"]) > atr * sig_cfg.big_candle_mult
+                if trend_up and three_down and big_green and vol_strong:
+                    sl = min(prev["low"], prev2["low"]) - atr * sig_cfg.atr_stop_p5
+                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p5:
+                        return {"signal": "buy", "price": float(current_price),
+                               "stop": float(sl), "atr": float(atr),
+                               "reason": "v_reversal", "confidence": 0.75}
     
     return {"signal": "hold", "reason": "no_setup"}
 
+# ============================================================
+# 포지션 청산 (RiskConfig 적용)
+# ============================================================
 
-# ---------------------------
-# 포지션 관리
-# ---------------------------
-def check_position_exit(market, current_price, position_row, params: Params, strategy: StrategyConfig):
+def check_position_exit(market: str, current_price: float, position_row, 
+                       params: Params, strategy: StrategyConfig, risk_cfg: RiskConfig):
+    """포지션 청산 판단"""
     if is_excluded_coin(market):
         return False, None
     
-    entry_price = position_row['entry_price']
-    stop_loss = position_row['stop_loss']
-    direction = position_row['direction']
-    
-    # 수익률 계산
-    if direction == "long":
-        profit_pct = (current_price - entry_price) / entry_price
-    else:  # short
-        profit_pct = (entry_price - current_price) / entry_price
-    
-    # 데이터 수집
-    df = db_get_candles(market, "30m", limit=150)
-    if len(df) < 14:
+    try:
+        entry_price = float(position_row["entry_price"])
+        stop_loss = float(position_row["stop_loss"])
+        direction = position_row.get("direction", "long")
+        entry_time = float(position_row["entry_time"])
+    except Exception:
         return False, None
     
-    atr = calculate_atr(df, 14).iloc[-1]
+    if entry_price <= 0 or current_price is None or current_price <= 0:
+        return False, None
     
-    # ===== 익절 조건 추가 =====
-    # 1) 목표 수익률 도달 시 익절 (1.5% 이익)
-    target_profit = 0.015  # 1.5%
-    if profit_pct >= target_profit:
-        log_print(f" [TAKE_PROFIT] {market} 목표 수익 달성: {profit_pct*100:.2f}%")
-        return True, "take_profit"
+    profit_pct = ((current_price - entry_price) / entry_price
+                 if direction == "long"
+                 else (entry_price - current_price) / entry_price)
     
-    # 2) 중간 익절: 0.8% 이상 수익 시 절반 익절 (부분 실현)
-    # 이 로직은 execute에서 처리하거나, 여기서는 전체 청산만 다룸
+    max_loss = float(strategy.max_loss_per_trade)
+    take_profit = float(strategy.take_profit_pct)
+    trail_start = float(strategy.trailing_stop_profit_threshold)
+    time_stop_h = float(strategy.time_stop_hours)
+    trail_mult = float(risk_cfg.trail_atr_mult)
+    pullback_pct = float(risk_cfg.pullback_exit_pct)
+    pb_lookback = int(risk_cfg.pullback_lookback)
     
-    # 3) 고점 대비 하락 시 익절 (이익 구간에서의 추세 반전)
-    if profit_pct > 0.005:  # 0.5% 이상 수익 구간
-        recent_high = df['high'].tail(10).max()
-        pullback_pct = (recent_high - current_price) / recent_high
-        
-        # 고점 대비 1% 이상 하락하면 익절
-        if pullback_pct > 0.01:
-            log_print(f" [PULLBACK_EXIT] {market} 고점 대비 하락: {pullback_pct*100:.2f}%")
-            return True, "pullback_from_profit"
-    
-    # ===== 개선된 손절 조건 =====
-    # 1) 기존 손절가 도달
+    # 1) Stop-loss
     if direction == "long" and current_price <= stop_loss:
-        # 하지만 손실이 너무 작으면 (< -0.5%) 대기
-        if profit_pct < -0.005:
-            return True, "stop_loss"
-        else:
-            return False, None  # 미세 손실은 무시
-    
+        logger.info(f" [STOP_LOSS] {market} {current_price:,.0f} <= {stop_loss:,.0f}")
+        return True, "stop_loss"
     if direction == "short" and current_price >= stop_loss:
-        if profit_pct < -0.005:
-            return True, "stop_loss"
-        else:
-            return False, None
+        logger.info(f" [STOP_LOSS] {market} {current_price:,.0f} >= {stop_loss:,.0f}")
+        return True, "stop_loss"
     
-    # 2) 최대 손실 제한 (strategy 설정 기반)
-    max_loss = strategy.max_loss_per_trade  # 기본 2%
+    # 2) 최대 손실
     if profit_pct <= -max_loss:
-        log_print(f" [MAX_LOSS] {market} 최대 손실 도달: {profit_pct*100:.2f}%")
+        logger.info(f" [MAX_LOSS] {market} {profit_pct*100:.2f}% (limit {max_loss*100:.2f}%)")
         return True, "max_loss"
     
-    # ===== 트레일링 스톱 (수익 보호) =====
-    if direction == "long":
-        # 수익이 1.5% 이상일 때만 트레일링 스톱 활성화
-        if profit_pct > strategy.trailing_stop_profit_threshold:
-            # 현재가 기준 아래 ATR 2배 위치로 스톱 상향
-            trailing_stop = current_price - (atr * 2.0)  # 기존 3배 → 2배로 타이트하게
-            
-            if trailing_stop > stop_loss:
-                con = sqlite3.connect(CFG.db_path)
-                cur = con.cursor()
-                cur.execute("UPDATE positions SET stop_loss=? WHERE market=?",
-                            (trailing_stop, market))
-                con.commit()
-                con.close()
-                log_print(f" [TRAILING] {market} 스톱 업데이트: {stop_loss:,.0f} → {trailing_stop:,.0f}원 (수익: {profit_pct*100:.2f}%)")
+    # 3) 목표 수익
+    if profit_pct >= take_profit:
+        logger.info(f" [TAKE_PROFIT] {market} {profit_pct*100:.2f}% (target {take_profit*100:.2f}%)")
+        return True, "take_profit"
     
-    # 3) 장기 보유 시 자동 청산 (48시간 이상)
-    holding_hours = (time.time() - position_row['entry_time']) / 3600
-    if holding_hours > 48:
-        if profit_pct > 0:  # 수익이라면 청산
-            log_print(f" [LONG_HOLD] {market} 장기 보유 익절: {holding_hours:.1f}시간")
-            return True, "long_hold_profit"
-        elif profit_pct < -0.015:  # 손실 1.5% 이상이면 청산
-            log_print(f" [LONG_HOLD] {market} 장기 보유 손절: {holding_hours:.1f}시간")
-            return True, "long_hold_loss"
+    # 4) 시간 기반 청산
+    holding_h = (time.time() - entry_time) / 3600.0
+    if holding_h >= time_stop_h and profit_pct <= 0:
+        logger.info(f" [TIME_STOP] {market} {holding_h:.1f}h {profit_pct*100:.2f}%")
+        return True, "time_stop"
+    
+    # 5) Pullback 청산
+    if profit_pct >= max(trail_start, 0.008):
+        df = db_get_candles(market, "30m", limit=pb_lookback + 5)
+        if len(df) >= pb_lookback:
+            recent_high = float(df["high"].tail(pb_lookback).max())
+            if recent_high > 0:
+                pb = (recent_high - current_price) / recent_high
+                if pb >= pullback_pct:
+                    logger.info(f" [PULLBACK] {market} -{pb*100:.2f}%")
+                    return True, "pullback_from_profit"
+    
+    # 6) 트레일링 스톱 업데이트
+    if direction == "long" and profit_pct >= trail_start:
+        df = db_get_candles(market, "30m", limit=150)
+        if len(df) >= 14:
+            atr_s = calculate_atr(df, 14)
+            atr = float(atr_s.iloc[-1]) if len(atr_s) > 0 else 0.0
+            if atr > 0:
+                trailing = current_price - atr * trail_mult
+                if trailing > stop_loss:
+                    try:
+                        con = sqlite3.connect(CFG.db_path)
+                        cur = con.cursor()
+                        cur.execute("UPDATE positions SET stop_loss=? WHERE market=?",
+                                   (trailing, market))
+                        con.commit()
+                        con.close()
+                        logger.info(f" [TRAILING] {market} {stop_loss:,.0f}→{trailing:,.0f}")
+                    except Exception as e:
+                        logger.error(f"[ERROR] trailing stop 업데이트 실패: {e}")
     
     return False, None
 
+# ============================================================
+# 주문 실행 (RiskConfig 적용)
+# ============================================================
+def execute_order(market: str, direction: str, price: float, size: float, risk_cfg: RiskConfig = None):
+    """주문 실행"""
+    if risk_cfg is None:
+        risk_cfg = RiskConfig()
 
-# ---------------------------
-# 주문 실행 (API 2.0)
-# ---------------------------
-def execute_order(market, direction, price, size, wait_sec=30):
-    """
-    주문 실행 함수
-    - 매수: 지정가 실패 → 시장가 매수
-    - 매도: 3회 단계적 가격 하향(1/3씩) → 시장가 매도
-    """
     if is_excluded_coin(market):
         return {"success": False, "order_id": None, "message": "Excluded coin", "fee": 0}
 
+    if price is None or price <= 0:
+        logger.error(f"[ERROR] {market} 잘못된 가격: {price}")
+        return {"success": False, "order_id": None, "message": "Invalid price", "fee": 0}
+
+    if size is None or size <= 0:
+        logger.error(f"[ERROR] {market} 잘못된 수량: {size}")
+        return {"success": False, "order_id": None, "message": "Invalid size", "fee": 0}
+
+    min_order = CFG.min_order_krw * risk_cfg.min_order_mult
+
+    if price * size < min_order:
+        logger.error(f"[ERROR] {market} 최소 주문 미달: {price*size:,.0f}원")
+        return {"success": False, "order_id": None, "message": "Below minimum order", "fee": 0}
+
     api = BithumbPrivateAPI()
+    wait_sec = risk_cfg.order_wait_sec
 
-    # ===========================
-    # [매수 Logic] 기존 유지
-    # ===========================
     if direction == "buy":
-        # 1. 지정가 주문
-        result = api.place_order(
-            market=market,
-            side="bid",
-            price=str(int(price)),
-            volume=str(size),
-            ord_type="limit"
-        )
+        result = api.place_order(market=market, side="bid",
+                                 price=str(int(price)), volume=str(size), ord_type="limit")
 
+        if not result or "uuid" not in result:
+            logger.error(f"[ERROR] {market} 매수 주문 접수 실패")
+            return {"success": False, "order_id": None, "message": "Order failed", "fee": 0}
+
+        order_id = result["uuid"]
+        logger.info(f"[BUY ORDER] {market} 지정가 매수 접수 | 가격: {price:,.0f} | 수량: {size:.6f} | 대기: {wait_sec}초")
+
+        # 체결 대기 루프
+        start = time.time()
+        while time.time() - start < wait_sec:
+            order = api.get_order(order_id)
+            if order and order.get("state") == "done":
+                fee = calculate_buy_fee_and_total(price, size)["fee"]
+                logger.info(f"[BUY FILLED] {market} 완전 체결 | 수량: {size:.6f}")
+                return {"success": True, "order_id": order_id, "message": "Filled", "fee": fee}
+            time.sleep(1)
+
+        # 타임아웃 — 미체결 주문 취소, 시장가 재주문 없음
+        order = api.get_order(order_id)
+        exec_vol = 0.0
+        if order:
+            exec_vol = float(order.get("executed_volume", 0))
+
+        try:
+            api.cancel_order(order_id)
+            logger.info(f"[CANCEL] {market} {wait_sec}초 타임아웃 → 주문 취소 "
+                        f"(체결: {exec_vol:.6f} / 미체결: {size - exec_vol:.6f})")
+        except Exception as e:
+            logger.warning(f"[CANCEL] {market} 주문 취소 중 오류: {e}")
+
+        # 부분 체결이 있으면 부분 성공으로 반환
+        if exec_vol > 0:
+            fee = calculate_buy_fee_and_total(price, exec_vol)["fee"]
+            logger.info(f"[PARTIAL] {market} 부분 체결 포지션 등록 | 체결량: {exec_vol:.6f}")
+            return {"success": True, "order_id": order_id,
+                    "message": f"Partial filled ({exec_vol:.6f}), rest cancelled", "fee": fee}
+
+        # 완전 미체결 → 실패
+        return {"success": False, "order_id": None,
+                "message": f"Timeout after {wait_sec}s, order cancelled", "fee": 0}
+
+    else:  # sell
+        pub = BithumbPublic()
+        cur_mkt_price = pub.get_current_price(market) or price
+        result = api.place_order(market=market, side="ask",
+                                 volume=str(size), ord_type="market")
         if result and "uuid" in result:
-            order_id = result["uuid"]
-            # 체결 대기
-            start_time = time.time()
-            while time.time() - start_time < wait_sec:
-                order = api.get_order(order_id)
-                if order and order.get("state") == "done":
-                    fee_info = calculate_buy_fee_and_total(price, size)
-                    return {
-                        "success": True, 
-                        "order_id": order_id, 
-                        "message": "Filled", 
-                        "fee": fee_info["fee"]
-                    }
-                time.sleep(1)
-            # 미체결 취소
-            api.cancel_order(order_id)
-        
-        # 2. 시장가 매수
-        log_print(f"[MARKET BUY] 지정가 실패 → 시장가 매수 실행")
-        market_result = api.place_order(
-            market=market,
-            side="bid",
-            price=str(int(price * size)), # KRW 총액
-            ord_type="price" # 시장가 매수(KRW)
-        )
-        
-        if market_result and "uuid" in market_result:
-            fee_info = calculate_buy_fee_and_total(price, size)
-            return {
-                "success": True, 
-                "order_id": market_result["uuid"], 
-                "message": "Market buy", 
-                "fee": fee_info["fee"]
-            }
-        return {"success": False, "order_id": None, "message": "Market buy failed", "fee": 0}
+            fee = calculate_sell_fee_and_net(cur_mkt_price, size)["fee"]
+            return {"success": True, "order_id": result["uuid"], "message": "Market sell", "fee": fee}
+        return {"success": False, "order_id": None, "message": "Sell failed", "fee": 0}
 
-    # ===========================
-    # [매도 Logic] 3단계 하향 조정
-    # ===========================
-    else: # direction == "sell"
-        pub = BithumbPublic()
-        original_price = price
-        
-        # 3회 시도 (0, 1, 2)
-        for i in range(3):
-            try_price = original_price
-            
-            # 2회차, 3회차는 가격 조정
-            if i > 0:
-                current_market_price = pub.get_current_price(market)
-                if current_market_price:
-                    gap = original_price - current_market_price
-                    if gap > 0:
-                        # 1/3씩 하향 (Gap * 1/3, Gap * 2/3)
-                        decrement = gap * (i / 3.0)
-                        try_price = original_price - decrement
-                        try_price = adjust_price_to_tick(try_price) # 호가 단위 맞춤
-                        
-                        log_print(f"[RETRY SELL] {i+1}/3회차: 목표가 하향 {original_price:,.0f} -> {try_price:,.0f} (Gap: {gap:,.0f})")
-            
-            # 지정가 주문
-            result = api.place_order(
-                market=market,
-                side="ask",
-                price=str(int(try_price)),
-                volume=str(size),
-                ord_type="limit"
-            )
-            
-            if not result or "uuid" not in result:
-                log_print(f"[ERROR] 매도 주문 에러 (Attempt {i+1})")
-                time.sleep(1)
-                continue
-                
-            order_id = result["uuid"]
-            
-            # 체결 대기
-            start_time = time.time()
-            filled = False
-            while time.time() - start_time < wait_sec:
-                order = api.get_order(order_id)
-                if order and order.get("state") == "done":
-                    filled = True
-                    break
-                time.sleep(1)
-                
-            if filled:
-                fee_info = calculate_sell_fee_and_net(try_price, size)
-                return {
-                    "success": True, 
-                    "order_id": order_id, 
-                    "message": "Filled", 
-                    "fee": fee_info["fee"]
-                }
-            
-            # 미체결 시 취소하고 다음 루프(가격 낮춰서 재주문)
-            api.cancel_order(order_id)
-            
-        # 3. 시장가 매도 (3번 실패 시)
-        log_print(f"[MARKET SELL] 3회 지정가 실패 → 시장가 매도")
-        market_result = api.place_order(
-            market=market,
-            side="ask",
-            volume=str(size),
-            ord_type="market" # 시장가 매도(수량)
-        )
-        
-        if market_result and "uuid" in market_result:
-            fee_info = calculate_sell_fee_and_net(price, size)
-            return {
-                "success": True, 
-                "order_id": market_result["uuid"], 
-                "message": "Market sell", 
-                "fee": fee_info["fee"]
-            }
-            
-        return {"success": False, "order_id": None, "message": "Market sell failed", "fee": 0}
 
-# ---------------------------
-# 소액 잔고 정리(Dusting) 헬퍼 함수
-# ---------------------------
-def clear_dust_position(market, current_price, actual_balance, api):
-    """
-    최소 주문 금액 미달 포지션 청산 로직
-    - 전략: 최소 금액만큼 추가 매수 -> 합쳐서 즉시 전량 매도
-    """
-    needed_krw = 6000  # 최소 주문(5000원)보다 넉넉하게 잡음
-    available_krw = get_available_krw_balance()
+# ============================================================
+# AI Config 갱신 (영어 프롬프트)
+# ============================================================
+
+def ai_refresh_all_configs(ai_cfg: AIConfig, perf: dict) -> tuple:
+    """Ollama AI를 통해 모든 설정을 통합 업데이트 (영어 프롬프트)"""
+    if not CFG.ollama_url or not CFG.ollama_model:
+        logger.warning("[AI] Ollama not configured — skipping config update")
+        return ai_cfg, "(Ollama not configured)"
     
-    if available_krw < needed_krw:
-        log_print(f"[DUST_FAIL] {market} 소액 정리 실패: KRW 잔고 부족 ({available_krw:,.0f}원)")
-        return False, 0
+    current_json = json.dumps(ai_cfg.to_dict(), ensure_ascii=False, indent=2)
     
-    log_print(f"[DUST_ACTION] {market} 소액 청산 시도: {needed_krw}원 추가 매수 후 전량 매도")
-    
-    # 1. 시장가 매수 (덩치 키우기)
-    buy_res = api.place_order(
-        market=market,
-        side="bid",
-        price=str(needed_krw),
-        ord_type="price" # 시장가 매수
-    )
-    
-    if not buy_res or "uuid" not in buy_res:
-        log_print(f"[DUST_ERROR] 추가 매수 실패")
-        return False, 0
-        
-    time.sleep(1.5) # 체결 대기
-    
-    # 2. 잔고 재조회 (합쳐진 수량 확인)
-    total_balance = get_coin_balance(market)
-    
-    # 3. 시장가 전량 매도
-    sell_res = api.place_order(
-        market=market,
-        side="ask",
-        volume=str(total_balance),
-        ord_type="market" # 시장가 매도
-    )
-    
-    if sell_res and "uuid" in sell_res:
-        log_print(f"[DUST_SUCCESS] 소액 청산 완료")
-        # 수수료 대략 계산 (매수+매도)
-        dust_fee = (needed_krw * 0.0025) + (total_balance * current_price * 0.0025)
-        return True, dust_fee
-    else:
-        log_print(f"[DUST_ERROR] 전량 매도 실패")
-        return False, 0
+    prompt = f"""
+You are an AI cryptocurrency swing trading bot parameter optimization expert.
+You are trading on Bithumb Exchange using 30-minute candle data for KRW markets.
 
+## Current Performance Metrics
+- Total Trades: {perf.get("total_trades", 0)}
+- Win Rate: {perf.get("win_rate", 0)*100:.1f}%
+- Profit Factor: {perf.get("profit_factor", 0):.2f}
+- Total PnL: {perf.get("total_pnl", 0):+,.0f} KRW
+- Average Holding Time: {perf.get("avg_holding_hours", 0):.1f} hours
+- Average Profit: {perf.get("avg_profit", 0):+,.0f} KRW
+- Average Loss: {abs(perf.get("avg_loss", 0)):,.0f} KRW
+- Total Fees: {perf.get("total_fees", 0):,.0f} KRW
 
-# ---------------------------
-# 리밸런싱
-# ---------------------------
-def rebalance_portfolio(universe, params: Params, strategy: StrategyConfig):
-    """포트폴리오 리밸런싱 (수정됨: 잔고 동기화 및 투자금액 제한 해제)"""
-    positions = db_get_positions()
-    pub = BithumbPublic()
-    priv_api = BithumbPrivateAPI()
+## Current Configuration (JSON)
+{current_json}
 
-    # 시작 전 DB 포지션과 실제 잔고 강제 동기화 (Sync)
-    # 앱에서 매도했거나 수량이 바뀐 경우를 봇이 매번 인지하도록 함
-    if not positions.empty:
-        log_print("[SYNC] 보유 포지션 실제 잔고 동기화 중...")
-        for _, pos in positions.iterrows():
-            market = pos['market']
-            # 실제 잔고 조회
-            real_balance = get_coin_balance(market)
-            
-            # 잔고가 없으면(이미 팔았으면) DB에서 삭제
-            if real_balance <= 0.0001:  # 0에 가까우면 삭제
-                log_print(f"[SYNC] {market} 실제 잔고 없음 -> DB에서 포지션 삭제")
-                db_remove_position(market)
-            # 잔고가 DB와 다르면 업데이트 (부분 매도 등)
-            elif abs(real_balance - pos['size']) / pos['size'] > 0.05: # 5% 이상 차이나면
-                log_print(f"[SYNC] {market} 수량 불일치 보정 ({pos['size']} -> {real_balance})")
-                con = sqlite3.connect(CFG.db_path)
-                cur = con.cursor()
-                cur.execute("UPDATE positions SET size=? WHERE market=?", (real_balance, market))
-                con.commit()
-                con.close()
+## Adjustable Parameter Ranges
 
-    # 동기화 후 포지션 다시 로드
-    positions = db_get_positions()
+### params
+risk_per_trade: 0.010~0.080 | max_positions: 1~5
+trend_ma_fast: 5~30 | trend_ma_slow: 30~120
+cooldown_minutes: 15~240 | atr_mult_stop: 1.0~5.0
 
-    # 1) 기존 포지션 관리 (청산 로직)
-    for _, pos in positions.iterrows():
-        market = pos['market']
-        
-        # 제외 코인 무시
-        if is_excluded_coin(market):
-            continue
+### strategy
+max_loss_per_trade: 0.008~0.050 | take_profit_pct: 0.010~0.100
+time_stop_hours: 6~120 | trailing_stop_profit_threshold: 0.008~0.050
+min_volume_mult: 0.5~3.0
 
-        current_price = pub.get_current_price(market)
-        if current_price is None:
-            continue
+### signal (AI-controlled)
+rsi_min: 15~45 | rsi_max: 50~80 | rsi_oversold: 20~45 | rsi_overbought: 60~85
+price_pos_min: 0.05~0.40 | price_pos_max: [min+0.05]~0.70 | price_pos_block: 0.60~0.98
+price_pos_lookback: 5~30 | trend_strong_pct: 0.003~0.08
+volume_confirm_mult: 0.3~1.5 | volume_strong_mult: 1.0~4.0
+bb_lower_touch_pct: 0.00~0.05 | candle_strength_mult: 0.1~2.0 | big_candle_mult: 0.3~3.0
+atr_stop_p1~p5: 0.3~4.0 (ATR stop multiplier per pattern)
+stop_margin_p1~p5: 0.90~0.99 (stop safety margin per pattern)
+use_pattern_1~5: true/false (pattern activation)
+pattern_priority: [1~5 permutation] (check priority order, e.g., [3,1,2,4,5])
 
-        should_exit, reason = check_position_exit(market, current_price, pos, params, strategy)
+### risk (AI-controlled)
+trail_atr_mult: 1.0~5.0 | pullback_exit_pct: 0.005~0.08 | pullback_lookback: 3~30
+cooldown_after_loss: 30~360 | cooldown_after_win: 5~120 | cooldown_default: 1~30
+invest_capital_pct: 0.20~0.90 | risk_multiplier: 2.0~20.0
+order_wait_sec: 5~120 | market_order_buffer: 1.00~1.30 | available_krw_safety: 0.70~0.99
 
-        if should_exit:
-            # 실시간 잔고 재조회
-            actual_balance = get_coin_balance(market)
-            
-            # (이미 위에서 동기화 했지만, 찰나의 순간을 위해 다시 체크)
-            if actual_balance <= 0:
-                db_remove_position(market)
-                continue
+## Analysis and Adjustment Guidelines
 
-            # 최소 주문 금액 미달 처리 로직
-            sell_value = current_price * actual_balance
-            if sell_value < CFG.min_order_krw:
-                log_print(f"[INFO] {market} 청산 금액({sell_value:,.0f}원)이 최소 주문금액 미달")
-                
-                # AI 판단 및 소액 정리 로직 (기존 유지)
-                analysis = generate_swing_signals(market, params, strategy)
-                is_bullish = (analysis["signal"] == "buy")
-                is_urgent_exit = (reason in ["stop_loss", "max_loss", "long_hold_loss"])
+1. Win Rate < 40%: Strengthen RSI filter (lower rsi_max), narrow price_pos range
+2. Win Rate > 60%: Relax entry conditions, consider increasing max_positions
+3. Profit Factor < 1.5: Expand take_profit or reduce max_loss
+4. Avg Holding < 10h: Increase time_stop_hours, expand trail_atr_mult
+5. Trade Count < 3: Relax entry conditions (raise price_pos_block, raise rsi_max)
+6. Trade Count > 20: Tighten conditions, increase cooldown
+7. If losses exceed profits: Reduce atr_stop multipliers, adjust stop_margin
+8. pattern_priority: Place better-performing patterns first
+9. If fees exceed 20% of PnL: Set minimum take_profit_pct to at least 0.02
 
-                if is_bullish and not is_urgent_exit:
-                    log_print(f" └ [AI 판단] 📈 상승/반등 가능성 있음 (Reason: {reason}) -> 홀딩 및 대기")
-                    continue
-                else:
-                    log_print(f" └ [AI 판단] 📉 하락 리스크 큼 (Reason: {reason}) -> '물타기 후 탈출' 시도")
-                    success, fee = clear_dust_position(market, current_price, actual_balance, priv_api)
-                    if success:
-                        db_remove_position(market)
-                    continue
+You MUST respond ONLY in the following JSON format (explanations only in changes_summary):
 
-            log_print(f"[EXIT] 청산: {market} @ {current_price:,.0f}원 (수량: {actual_balance}) 사유: {reason}")
-
-            # 매도 실행
-            exit_result = execute_order(market, "sell", current_price, actual_balance)
-
-            if exit_result["success"]:
-                pnl_gross = (current_price - pos['entry_price']) * pos['size']
-                total_fee = pos.get('entry_fee', 0) + exit_result['fee']
-                pnl_net = pnl_gross - total_fee
-                if pos['direction'] == "short": # 현물에선 없지만 로직 유지
-                    pnl_net = -pnl_net
-                
-                holding_hours = (time.time() - pos['entry_time']) / 3600
-                
-                con = sqlite3.connect(CFG.db_path)
-                cur = con.cursor()
-                cur.execute("""
-                    INSERT INTO trades 
-                    (market, direction, entry_price, exit_price, size, entry_time, exit_time, pnl, total_fee, holding_hours, exit_reason)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (market, pos['direction'], pos['entry_price'], current_price, 
-                      pos['size'], pos['entry_time'], int(time.time()), pnl_net, total_fee, holding_hours, reason))
-                con.commit()
-                con.close()
-                
-                log_print(f" 순손익: {pnl_net:+,.0f}원 (보유: {holding_hours:.1f}시간)")
-                db_remove_position(market)
-
-    # 2) 신규 진입 탐색
-    # 현재 관리 중인 포지션 수 재확인
-    current_positions_df = db_get_positions()
-    ai_managed_positions = 0
-    if not current_positions_df.empty:
-        for _, pos in current_positions_df.iterrows():
-            if not is_excluded_coin(pos['market']):
-                ai_managed_positions += 1
-
-    if ai_managed_positions >= params.max_positions:
-        log_print(f"[INFO] 최대 포지션 수 도달 ({ai_managed_positions}/{params.max_positions})")
-        return
-
-    # 잔고 조회
-    available_krw = get_available_krw_balance()
-    if available_krw < CFG.min_order_krw:
-        log_print(f"[INFO] 잔고 부족 ({available_krw:,.0f}원)")
-        return
-
-    log_print(f"[INFO] 사용 가능 잔고: {available_krw:,.0f}원")
-
-    # 진입 쿨타임 체크 등 기존 로직
-    last_entries = db_get_meta("last_entries", "{}")
-    last_entries = json.loads(last_entries)
-    current_time = time.time()
-    
-    signals = []
-    for market in universe:
-        if is_excluded_coin(market): continue
-        
-        # 쿨타임 체크
-        if market in last_entries:
-            elapsed_minutes = (current_time - last_entries[market]) / 60
-            if market in current_positions_df['market'].values:
-                if elapsed_minutes < params.cooldown_minutes: continue
-            else:
-                if elapsed_minutes < 5: continue
-        
-        # 이미 보유중이면 패스
-        if not current_positions_df.empty and market in current_positions_df['market'].values:
-            continue
-
-        signal = generate_swing_signals(market, params, strategy)
-        if signal["signal"] in ["buy"]: # 매수 시그널만
-            signals.append((market, signal))
-
-    if not signals:
-        log_print("[INFO] 진입 가능한 시그널 없음")
-        return
-
-    log_print(f"[SIGNAL] 감지된 시그널: {len(signals)}개")
-
-    # 3) 포지션 크기 계산 및 주문 [수정 2: 투자 비중 확대]
-    available_slots = params.max_positions - ai_managed_positions
-    if available_slots <= 0: return
-
-    # 균등 분할 방식: (가용 잔고 * 투자비중) / 남은 자리 수
-    # 예: 잔고 1000만원, 비중 100%(1.0), 남은 자리 5개 -> 종목당 200만원
-    # 안전을 위해 한 번에 전액을 다 쓰지 않도록 가용 잔고의 99%만 계산에 사용
-    
-    allocatable_krw = available_krw * params.position_allocation_pct # 투자 할당 비중 (0.7 등)
-    position_size_krw = allocatable_krw / available_slots
-    
-    # 너무 작은 금액 방지 (최소 1만원 이상일 때만)
-    if position_size_krw < 10000:
-        position_size_krw = available_krw  # 잔액이 적으면 그냥 잔액 전부 투입 (단, min_order_krw 체크는 뒤에서 함)
-
-    log_print(f"[DEBUG] 1종목당 투자 예정 금액: {position_size_krw:,.0f}원 (남은 슬롯: {available_slots}개)")
-
-    for i, (market, signal) in enumerate(signals[:available_slots]):
-        if signal["signal"] == "sell": continue # 매도 시그널은 진입 안함
-        
-        # 리스크 기반 수량 계산 (기존 로직 활용하되, 한도 제한 해제)
-        risk_krw = position_size_krw * params.risk_per_trade
-        price_risk = abs(signal["price"] - signal["stop"])
-        
-        size = 0
-        if price_risk > 0:
-            size = risk_krw / price_risk
-        
-        # 다만, 계산된 size가 할당된 금액(position_size_krw)을 넘지 않도록 캡
-        max_size_by_capital = position_size_krw / signal["price"]
-        
-        # 코인별 최대 비중(max_coin_weight) 체크
-        # (전체 자산 대비 너무 큰 비중 방지)
-        # 하지만 여기선 position_size_krw 자체가 이미 분할된 금액이므로, 
-        # size가 max_size_by_capital보다 크지만 않게 하면 됨.
-        
-        if size == 0 or size > max_size_by_capital:
-             size = max_size_by_capital # 리스크 계산 무시하고 자금력만큼 매수 (공격적)
-
-        # 최종 수량 및 금액 계산
-        buy_info = calculate_buy_fee_and_total(signal["price"], size)
-
-        # 최소 주문 금액 체크
-        if buy_info["total"] < CFG.min_order_krw:
-            min_size = adjust_min_order_size(signal["price"])
-            min_buy_info = calculate_buy_fee_and_total(signal["price"], min_size)
-            
-            if min_buy_info["total"] <= available_krw:
-                log_print(f"[ADJUST] 최소 주문금액 보정 → 수량 {size:.6f} → {min_size:.6f}")
-                size = min_size
-                buy_info = min_buy_info
-            else:
-                log_print(f"[SKIP] 최소 주문금액 맞추기엔 잔고 부족")
-                continue
-
-        # 실제 잔고 재확인 (루프 돌면서 잔고 줄어듦)
-        if buy_info["total"] > available_krw:
-            log_print(f"[SKIP] {market} 잔고 부족 (필요: {buy_info['total']:,.0f}, 잔고: {available_krw:,.0f})")
-            continue
-
-        log_print(f"[ENTRY] 진입 준비: {market}")
-        log_print(f" 가격: {signal['price']:,.0f}원")
-        log_print(f" 수량: {size:.6f}")
-        log_print(f" 총액: {buy_info['total']:,.0f}원")
-        log_print(f" 손절가: {signal['stop']:,.0f}원")
-
-        entry_price = get_entry_price(signal["price"], "buy")
-        
-        order_result = execute_order(market, "buy", entry_price, size)
-
-        if order_result["success"]:
-            log_print(f"[SUCCESS] 진입 완료: {market}")
-            db_add_position(
-                market, 
-                signal["price"], # 진입가는 시그널 가격 기준 or 체결가
-                size, 
-                signal["stop"], 
-                "long", 
-                order_result['fee']
-            )
-            
-            last_entries[market] = current_time
-            db_set_meta("last_entries", json.dumps(last_entries))
-            
-            # 잔고 차감 반영
-            available_krw -= buy_info["total"]
-            log_print(f" 남은 잔고: {available_krw:,.0f}원")
-            
-            time.sleep(0.5)
-
-def get_entry_price(price, direction):
-    """
-    체결 우선 지정가
-    """
-    if direction == "buy":
-        return adjust_price_to_tick(price * 1.001)
-    else:
-        return adjust_price_to_tick(price * 0.999)
-
-def adjust_min_order_size(price, min_krw=7000, buffer=1.02):
-    """
-    빗썸 지정가 최소주문 보정
-    """
-    return math.ceil((min_krw * buffer) / price * 1e8) / 1e8
-
-def adjust_price_to_tick(price):
-    """빗썸 호가 단위에 맞춰 가격 조정"""
-    if price < 100:
-        return round(price, 1)  # 0.1원 단위
-    elif price < 1000:
-        return round(price)  # 1원 단위
-    elif price < 10000:
-        return round(price / 5) * 5  # 5원 단위
-    elif price < 100000:
-        return round(price / 10) * 10  # 10원 단위
-    else:
-        return round(price / 100) * 100  # 100원 단위
-    
-# ---------------------------
-# Market List
-# ---------------------------
-def build_universe():
-    """유니버스 구성 (API 2.0)"""
-    try:
-        pub = BithumbPublic()
-        markets = pub.get_markets()
-        
-        if not markets:
-            return []
-        
-        # KRW 마켓만 필터링, BTC/ETH 제외
-        krw_markets = []
-        for market in markets:
-            market_id = market['market']
-            if market_id.startswith('KRW-'):
-                currency = market_id.split('-')[1]
-                if currency.upper() not in [x.upper() for x in CFG.exclude]:
-                    krw_markets.append(market_id)
-        
-        log_print(f"[UNIVERSE] AI 관리 유니버스: {len(krw_markets)}개")
-        log_print(f"  제외 (사용자 직접 투자): {', '.join(CFG.exclude)}")
-        
-        return krw_markets[:CFG.universe_size]
-    
-    except Exception as e:
-        log_print(f"[ERROR] 유니버스 구성 실패: {e}")
-        return []
-
-def filter_fields(cls, data: dict):
-    return {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-
-# ---------------------------
-# AI 리밸런싱 로그 추가
-# ---------------------------
-def log_param_changes(old_params, new_params, old_strategy, new_strategy):
-    """파라미터 및 전략 변경 사항을 상세 로그로 기록"""
-    changes = []
-
-    oldp = asdict(old_params)
-    newp = asdict(new_params)
-    for key in oldp:
-        if oldp[key] != newp[key]:
-            changes.append(f"PARAM {key}: {oldp[key]} -> {newp[key]}")
-
-    olds = asdict(old_strategy)
-    news = asdict(new_strategy)
-    for key in olds:
-        if olds[key] != news[key]:
-            changes.append(f"STRATEGY {key}: {olds[key]} -> {news[key]}")
-
-    if changes:
-        log_print("[AI_REBALANCE] Config 변경 감지:")
-        for c in changes:
-            log_print(" - " + c)
-        text = "\n".join(changes)
-    else:
-        log_print("[AI_REBALANCE] Config 변경 없음")
-        text = "(변경 없음)"
-
-    return text
-# ---------------------------
-# AI Controller
-# ---------------------------
-def ollama_update_params_and_strategy(performance: dict, learning_history: pd.DataFrame, current_params: Params, current_strategy: StrategyConfig):
-    """AI 파라미터 및 전략 동적 조정"""
-    sys = (
-        "You are a quantitative crypto trading AI.\n"
-        "Your task is to update trading parameters.\n\n"
-        "STRICT RULES:\n"
-        "1. Output ONLY valid JSON\n"
-        "2. Do NOT add explanations\n"
-        "3. Do NOT add comments\n"
-        "4. Do NOT wrap JSON in markdown\n"
-        "5. If total_trades == 0, return EMPTY objects\n\n"
-        "JSON SCHEMA:\n"
-        "{\n"
-        '  "params": { OPTIONAL PARAM UPDATES },\n'
-        '  "strategy": { OPTIONAL STRATEGY UPDATES }\n'
-        "}\n\n"
-        "VALID EXAMPLE:\n"
-        "{\n"
-        '  "params": {"risk_per_trade": 0.004},\n'
-        '  "strategy": {"min_volume_mult": 1.2}\n'
-        "}\n\n"
-        "EMPTY EXAMPLE:\n"
-        "{\n"
-        '  "params": {},\n'
-        '  "strategy": {}\n'
-        "}"
-    )
-    
-    learning_summary = []
-    if not learning_history.empty:
-        for _, row in learning_history.head(5).iterrows():
-            learning_summary.append({
-                "timestamp": row['timestamp'],
-                "win_rate": row['win_rate'],
-                "performance_score": row['performance_score']
-            })
-    
-    user = {
-        "task": "과거 거래 성과를 분석하고 파라미터와 전략을 개선하라.",
-        "current_performance": performance,
-        "learning_history": learning_summary,
-        "current_params": asdict(current_params),
-        "current_strategy": asdict(current_strategy)
-    }
-
-    payload = {
-        "model": CFG.ollama_model,
-        "messages": [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
-        ],
-        "temperature": 0.1,
-        "stream": False
-    }
+{{
+  "params": {{ ... }},
+  "strategy": {{ ... }},
+  "signal": {{ ... }},
+  "risk": {{ ... }},
+  "changes_summary": "Brief summary of changes in English"
+}}
+"""
     
     try:
-        resp = requests.post(CFG.ollama_url, json=payload, timeout=60)
-        resp.raise_for_status()
-        content = resp.json()["message"]["content"].strip()
-        
-        match = re.search(r'\{[\s\S]*\}', content)
-        if not match:
-            raise ValueError(f"JSON not found: {content}")
-        
-        obj = json.loads(match.group())
-        
-        new_params = Params(**filter_fields(
-            Params,
-            {**asdict(current_params), **obj.get("params", {})}
-        ))
-        
-        new_strategy = StrategyConfig(**filter_fields(
-            StrategyConfig,
-            {**asdict(current_strategy), **obj.get("strategy", {})}
-        ))
-        
-        # ✨ 변경 사항 로그 추가
-        change_text = log_param_changes(PARAMS, new_params, STRATEGY, new_strategy)
-        save_ai_change_summary(change_text)
-
-        performance_score = (
-            performance["win_rate"] * performance["profit_factor"]
-            if performance["total_trades"] > 0 else 0
+        resp = requests.post(
+            CFG.ollama_url,
+            json={"model": CFG.ollama_model, "prompt": prompt, "stream": False},
+            timeout=180
         )
+        response_text = resp.json().get("response", "")
+        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if not json_match:
+            return ai_cfg, "(AI response parsing failed)"
         
-        db_save_ai_learning(
-            win_rate=performance["win_rate"],
-            avg_profit=performance["avg_profit"],
-            avg_loss=performance["avg_loss"],
-            total_trades=performance["total_trades"],
-            params_json=json.dumps(asdict(new_params)),
-            strategy_json=json.dumps(asdict(new_strategy)),
-            performance_score=performance_score
-        )
-        
-        return new_params, new_strategy
-    
+        parsed = json.loads(json_match.group())
+        summary = parsed.pop("changes_summary", "(No changes)")
+        new_cfg = AIConfig.from_dict(parsed)
+        new_cfg = validate_and_clamp_config(new_cfg)
+        new_cfg.save_to_db()
+        save_ai_change_summary(summary)
+        logger.info(f"[AI] Config updated: {summary[:100]}")
+        return new_cfg, summary
     except Exception as e:
-        log_print(f"[ERROR] AI 갱신 실패: {e}")
-        return current_params, current_strategy
+        logger.error(f"[AI] Config update error: {e}")
+        return ai_cfg, f"(Error: {e})"
 
+# ============================================================
+# 메인 루프
+# ============================================================
 
-# ---------------------------
-# Main Loop
-# ---------------------------
 def run():
-    log_print("="*60)
-    log_print("[START] 빗썸 AI 스윙 트레이딩 봇 (API 2.0)")
-    log_print("  - AI 관리: BTC, ETH 제외 알트코인")
-    log_print("  - API 2.0 사용")
-    log_print("="*60)
+    global AI_CFG
+    logger.info("=" * 60)
+    logger.info("[STARTUP] Trading Bot Started")
+    logger.info("=" * 60)
     
     init_db()
+    threading.Thread(target=log_rotation_scheduler, daemon=True).start()
+    
+    # DB에서 AI 설정 로드
+    AI_CFG = AIConfig.load_from_db()
+    AI_CFG = validate_and_clamp_config(AI_CFG)
+    
     pub = BithumbPublic()
-
-    log_print("[LOADING] 마켓 데이터 로딩...")
-    universe = build_universe()
-    
-    if not universe:
-        log_print("[ERROR] 마켓 리스트 조회 실패")
-        return
-    
-    log_print(f"[SUCCESS] AI 관리 유니버스: {len(universe)}개")
-    log_print(f"  상위 5개: {', '.join(universe[:5])}")
-    
+    last_ai_refresh = 0
     print_portfolio_summary()
-
-    last_ai = 0
-    cycle = 0
-    
-    global PARAMS, STRATEGY
     
     while True:
-        t0 = time.time()
-        cycle += 1
-        log_print(f"{'='*60}")
-        log_print(f"[CYCLE #{cycle}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        log_print(f"{'='*60}")
-
-        # 1) 캔들 수집
-        log_print("[DATA] 캔들 수집...")
-        collected = 0
-        
-        for market in universe:
-            if is_excluded_coin(market):
-                continue
+        try:
+            logger.info("=" * 60)
+            logger.info(f"[CYCLE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("=" * 60)
             
-            try:
-                data = pub.get_day_candles(market, count=200)
-                
-                if data:
-                    rows = parse_candles_to_rows(data, market, "30m")
+            params = AI_CFG.params
+            strategy = AI_CFG.strategy
+            sig_cfg = AI_CFG.signal
+            risk_cfg = AI_CFG.risk
+            
+            # 1. 캔들 수집
+            markets = [m["market"] for m in pub.get_markets()
+                      if m["market"].startswith(CFG.quote + "-")][:CFG.universe_size]
+            collect_candles(markets)
+            
+            # 2. AI 설정 갱신
+            elapsed_ai = (time.time() - last_ai_refresh) / 60
+            if elapsed_ai >= CFG.ai_refresh_min:
+                perf = analyze_trading_performance()
+                AI_CFG, summary = ai_refresh_all_configs(AI_CFG, perf)
+                params = AI_CFG.params
+                strategy = AI_CFG.strategy
+                sig_cfg = AI_CFG.signal
+                risk_cfg = AI_CFG.risk
+                last_ai_refresh = time.time()
+            
+            # 3. 포지션 관리 (청산 체크)
+            positions = db_get_positions()
+            if not positions.empty:
+                for _, pos in positions.iterrows():
+                    market = pos["market"]
+                    if is_excluded_coin(market):
+                        continue
                     
-                    if rows:
-                        db_put_candles(rows)
-                        collected += 1
+                    actual_bal = get_coin_balance(market)
+                    if actual_bal <= 0:
+                        logger.info(f"SYNC: {market} 실제 잔고 없음. DB에서 포지션을 제거합니다.")
+                        db_remove_position(market)
+                        continue  # 이미 팔렸으므로 이후 로직 건너뜀
                 
-                time.sleep(0.1)
+                    current_price = pub.get_current_price(market)
+                    if current_price is None:
+                        continue
+                    
+                    should_exit, reason = check_position_exit(
+                        market, current_price, pos, params, strategy, risk_cfg)
+                    
+                    if should_exit:
+                        actual_bal = get_coin_balance(market)
+                        if actual_bal <= 0:
+                            continue
+                        
+                        logger.info(f"[EXIT] {market} {current_price:,.0f} ({reason})")
+                        result = execute_order(market, "sell", current_price, actual_bal, risk_cfg)
+                        
+                        if result["success"]:
+                            pnl = (current_price - pos["entry_price"]) * pos["size"]
+                            pnl -= (pos.get("entry_fee", 0) + result["fee"])
+                            holding_h = (time.time() - pos["entry_time"]) / 3600
+                            
+                            con = sqlite3.connect(CFG.db_path)
+                            cur = con.cursor()
+                            cur.execute("""INSERT INTO trades
+                                (market, direction, entry_price, exit_price, size,
+                                 entry_time, exit_time, pnl, total_fee, holding_hours, exit_reason)
+                                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                (market, pos.get("direction", "long"),
+                                 pos["entry_price"], current_price, pos["size"],
+                                 pos["entry_time"], int(time.time()),
+                                 pnl, result["fee"], holding_h, reason))
+                            con.commit()
+                            con.close()
+                            db_remove_position(market)
+            
+            # 4. 매수 신호 스캔
+            positions = db_get_positions()
+            ai_pos_count = sum(1 for _, p in positions.iterrows()
+                             if not is_excluded_coin(p["market"]))
+            
+            if ai_pos_count >= params.max_positions:
+                logger.info(f"[INFO] Max positions reached: {ai_pos_count}/{params.max_positions}")
+            else:
+                signals = []
+                for market in markets:
+                    if is_excluded_coin(market):
+                        continue
+                    if not positions.empty and market in positions["market"].values:
+                        continue
+                    
+                    sig = generate_swing_signals(market, params, strategy, sig_cfg)
+                    if sig["signal"] == "buy":
+                        signals.append((market, sig))
                 
-            except Exception as e:
-                log_print(f"[ERROR] {market} 수집 실패: {e}")
-        
-        log_print(f"[SUCCESS] {collected}개 수집 완료")
-
-        # 2) AI 학습
-        if time.time() - last_ai > CFG.ai_refresh_min * 60:
-            log_print("[AI] 학습 시작...")
-            
-            performance = analyze_trading_performance()
-            
-            log_print(f"[PERFORMANCE]")
-            log_print(f"  총 거래: {performance['total_trades']}회")
-            log_print(f"  승률: {performance['win_rate']*100:.1f}%")
-            log_print(f"  순손익: {performance['total_pnl']:+,.0f}원")
-            
-            learning_history = db_get_ai_learning_history(limit=10)
-            
-            PARAMS, STRATEGY = ollama_update_params_and_strategy(
-                performance=performance,
-                learning_history=learning_history,
-                current_params=PARAMS,
-                current_strategy=STRATEGY
-            )
-            
-            db_set_meta("params", json.dumps(asdict(PARAMS)))
-            db_set_meta("strategy", json.dumps(asdict(STRATEGY)))
-            last_ai = time.time()
-            
-            log_print(f"[AI] 학습 완료")
-
-        # 3) 리밸런싱
-        log_print("[REBALANCE] 리밸런싱...")
-        rebalance_portfolio(universe, PARAMS, STRATEGY)
-        
-        # 4) 포지션 요약
-        positions = db_get_positions()
-        if not positions.empty:
-            log_print(f"[POSITION] 현재 포지션:")
-            
-            ai_positions = []
-            excluded_positions = []
-            
-            for _, pos in positions.iterrows():
-                if is_excluded_coin(pos['market']):
-                    excluded_positions.append(pos['market'])
+                if not signals:
+                    logger.info("[INFO] No buy signals")
                 else:
-                    ai_positions.append(pos)
+                    logger.info(f"[SIGNAL] {len(signals)} buy signals found")
+                    avail_krw = get_available_krw_balance()
+                    slots = params.max_positions - ai_pos_count
+                    
+                    # 쿨다운 체크
+                    last_entries_raw = db_get_meta("last_entries", "{}")
+                    last_entries = json.loads(last_entries_raw)
+                    current_time = time.time()
+                    
+                    for market, signal in signals[:slots]:
+                        if market in last_entries:
+                            elapsed = (current_time - last_entries[market]) / 60
+                            recent = db_get_recent_trades_by_market(market, limit=1)
+                            if not recent.empty:
+                                last_exit = recent.iloc[0]["exit_reason"]
+                                if last_exit in ("max_loss", "stop_loss"):
+                                    min_wait = risk_cfg.cooldown_after_loss
+                                elif last_exit == "take_profit":
+                                    min_wait = risk_cfg.cooldown_after_win
+                                else:
+                                    min_wait = risk_cfg.cooldown_default
+                            else:
+                                min_wait = risk_cfg.cooldown_default
+                            
+                            if elapsed < min_wait:
+                                logger.info(f"[COOLDOWN] {market} {elapsed:.0f}/{min_wait}min")
+                                continue
+                        
+                        entry_price = signal["price"]
+                        total_cap = avail_krw
+                        
+                        invest = min(
+                            total_cap * params.risk_per_trade * risk_cfg.risk_multiplier,
+                            avail_krw * risk_cfg.invest_capital_pct
+                        )
+                        
+                        buy_info = calculate_buy_fee_and_total(entry_price, invest / entry_price)
+                        if buy_info["total"] > avail_krw:
+                            continue
+                        if buy_info["total"] < CFG.min_order_krw * risk_cfg.min_order_mult:
+                            continue
+                        
+                        size = invest / entry_price
+                        result = execute_order(market, "buy", entry_price, size, risk_cfg)
+                        
+                        if result["success"]:
+                            db_add_position(market, entry_price, size,
+                                          signal["stop"], "long", result["fee"])
+                            last_entries[market] = current_time
+                            avail_krw -= buy_info["total"]
+                            logger.info(f"[SUCCESS] {market} Buy completed @ {entry_price:,.0f}")
+                    
+                    db_set_meta("last_entries", json.dumps(last_entries))
             
-            if excluded_positions:
-                log_print(f"  제외 (사용자 직접 투자): {', '.join(excluded_positions)}")
-            
-            if ai_positions:
-                log_print(f"  AI 관리: {len(ai_positions)}개")
-                total_pnl = 0
-                
-                for pos in ai_positions:
-                    current_price = pub.get_current_price(pos['market'])
-                    if current_price:
-                        pnl_krw = (current_price - pos['entry_price']) * pos['size']
-                        total_pnl += pnl_krw
-                        log_print(f"    {pos['market']}: {pnl_krw:+,.0f}원")
-                
-                log_print(f"  미실현 손익: {total_pnl:+,.0f}원")
-        else:
-            log_print("[POSITION] 포지션 없음")
+            logger.info(f"\n[SLEEP] Waiting {CFG.collect_interval_sec} seconds...\n")
+            time.sleep(CFG.collect_interval_sec)
         
-        # 5) 포트폴리오 요약
-        print_portfolio_summary()
-
-        # Sleep
-        elapsed = time.time() - t0
-        sleep_time = max(1, CFG.collect_interval_sec - elapsed)
-        log_print(f"[WAIT] {sleep_time:.0f}초 대기...")
-        time.sleep(sleep_time)
-
+        except KeyboardInterrupt:
+            logger.info("\n[SHUTDOWN] Bot stopped")
+            break
+        except Exception as e:
+            logger.error(f"[ERROR] Main loop exception: {e}", exc_info=True)
+            time.sleep(30)
 
 if __name__ == "__main__":
-    # 스케줄러 스레드 시작
-    t = threading.Thread(target=log_rotation_scheduler, daemon=True)
-    t.start()
-
-    logger.info("트레이딩 봇 시작 및 로그 로테이션 스케줄러 가동")
-    try:
-        run()
-    except KeyboardInterrupt:
-        log_print("\n\n[STOP] 프로그램 종료")
-    except Exception as e:
-        log_print(f"\n[ERROR] 심각한 오류: {e}")
-        import traceback
-        traceback.print_exc()
+    run()
