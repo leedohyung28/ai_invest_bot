@@ -1498,7 +1498,7 @@ def ai_verify_buy_signal(market: str, current_price: float, df: pd.DataFrame, si
             change = (row['close'] - row['open']) / row['open'] * 100
             # 거래량 대비 이동평균선(20) 비율
             vol_ratio = row['volume'] / row['volume_ma'] if pd.notna(row['volume_ma']) and row['volume_ma'] > 0 else 1.0
-            chart_text += f"- Close: {row['close']:,.0f} | Change: {change:+.2f}% | VolRatio: {vol_ratio:.1fx} | RSI: {row['rsi']:.1f}\n"
+            chart_text += f"- Close: {row['close']:,.0f} | Change: {change:+.2f}% | VolRatio: {vol_ratio:.1f}x | RSI: {row['rsi']:.1f}\n"
 
         prompt = f"""
         You are a highly conservative Risk Manager for a crypto fund.
@@ -1693,16 +1693,16 @@ def run():
                             if not recent.empty:
                                 last_exit = recent.iloc[0]["exit_reason"]
                                 if last_exit in ("max_loss", "stop_loss"):
-                                    min_wait = riskcfg.cooldown_after_loss    # 90분 (손절 후)
+                                    min_wait = risk_cfg.cooldown_after_loss    # 90분 (손절 후)
                                 elif last_exit == "take_profit":
-                                    min_wait = riskcfg.cooldown_after_win     # 15분 (익절 후)
+                                    min_wait = risk_cfg.cooldown_after_win     # 15분 (익절 후)
                                 else:
                                     # time_stop, pullback_from_profit, force_exit 등 중립 청산 후
                                     # 기존 cooldown_default(5분) → params.cooldown_minutes(기본 90분) 로 연결
                                     min_wait = params.cooldown_minutes
                             else:
                                 # 거래 이력이 아예 없는 코인(신규 진입 시도)은 짧은 대기 유지
-                                min_wait = riskcfg.cooldown_default           # 5분 유지
+                                min_wait = risk_cfg.cooldown_default           # 5분 유지
                             if elapsed < min_wait:
                                 logger.info(
                                     f"[COOLDOWN] {market} {elapsed:.0f}/{min_wait}min "
