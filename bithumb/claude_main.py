@@ -1729,7 +1729,7 @@ def run():
                             df_verify["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
                             
                             # 3단계 검문관 승인/거절 판별
-                            gate_result = ai_verify_buy_signal(market, signal, df_verify, AI_CFG)
+                            gate_result = ai_verify_buy_signal(market, signal["price"], df_verify, signal.get("reason", "unknown"))
                             if gate_result == "reject":
                                 logger.info(f"[GATE] {market} AI 검문 거부 → 매수 취소")
                                 continue
