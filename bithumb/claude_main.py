@@ -17,6 +17,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 import threading, sys
+import re
 
 load_dotenv()
 
@@ -222,7 +223,7 @@ class SignalConfig:
     # ATR 손절 배수
     atr_stop_p1: float = 1.5
     atr_stop_p2: float = 1.2
-    atr_stop_p3: float = 1.0
+    atr_stop_p3: float = 0.4
     atr_stop_p4: float = 1.0
     atr_stop_p5: float = 1.0
     # 손절 안전 마진
@@ -237,8 +238,9 @@ class SignalConfig:
     use_pattern_3: bool = True
     use_pattern_4: bool = True
     use_pattern_5: bool = True
+    use_pattern_6: bool = True
     # 패턴 우선순위
-    pattern_priority: List[int] = field(default_factory=lambda: [3, 1, 2, 4, 5])
+    pattern_priority: List[int] = field(default_factory=lambda: [3, 1, 2, 4, 5, 6])
 
 @dataclass
 class RiskConfig:
@@ -253,9 +255,9 @@ class RiskConfig:
     cooldown_default: int = 5
     # 포지션 사이징
     invest_capital_pct: float = 0.55
-    risk_multiplier: float = 8.0
+    risk_multiplier: float = 4.0
     # 주문 실행
-    order_wait_sec: int = 30
+    order_wait_sec: int = 90
     market_order_buffer: float = 1.1
     available_krw_safety: float = 0.95
     min_order_mult: float = 1.0
@@ -266,6 +268,7 @@ class Config:
     db_path: str = os.getenv("DB_PATH", "trading_bot.db")
     ollama_url: str = os.getenv("OLLAMA_URL")
     ollama_model: str = os.getenv("OLLAMA_MODEL")
+    ollama_model_fast: str = os.getenv("OLLAMA_MODEL_FAST", os.getenv("OLLAMA_MODEL")) 
     quote: str = "KRW"
     exclude: tuple = ("BTC", "ETH")
     universe_size: int = 300
@@ -765,6 +768,18 @@ class BithumbPublic:
         except Exception as e:
             logger.error(f"[ERROR] {market} 현재가 조회 실패: {e}")
             return None
+        
+    def get_hour_candles(self, market: str, count: int = 100):
+        """1시간봉 캔들 조회"""
+        url = f"{self.base_url}/v1/candles/minutes/60"
+        params = {"market": market, "count": min(count, 200)}
+        try:
+            resp = self.sess.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"[ERROR] {market} 1H 캔들 조회 실패: {e}")
+            return []
 
 # ============================================================
 # 수수료 및 잔고 함수
@@ -926,14 +941,23 @@ def collect_candles(markets):
         if is_excluded_coin(market):
             continue
         try:
-            candles = pub.get_day_candles(market, count=300)
-            if candles:
-                rows = parse_candles_to_rows(candles, market, "30m")
+            # 기존 30분봉
+            candles_30m = pub.get_day_candles(market, count=300)
+            if candles_30m:
+                rows = parse_candles_to_rows(candles_30m, market, "30m")
                 if rows:
                     db_put_candles(rows)
+
+            # 신규: 1시간봉 추가 수집
+            candles_1h = pub.get_hour_candles(market, count=100)
+            if candles_1h:
+                rows_1h = parse_candles_to_rows(candles_1h, market, "1h")
+                if rows_1h:
+                    db_put_candles(rows_1h)
+
         except Exception as e:
             logger.error(f"[ERROR] {market} 캔들 수집 실패: {e}")
-        time.sleep(0.1)
+        time.sleep(0.15)   # 요청 간격 약간 늘림 (API 2회 호출)
 
 # ============================================================
 # 신호 생성 (SignalConfig 적용)
@@ -954,7 +978,7 @@ def generate_swing_signals(market, params: Params, strategy: StrategyConfig, sig
     df["ma_slow"] = calculate_ma(df, params.trend_ma_slow)
     df["volume_ma"] = df["volume"].rolling(20).mean()
     delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
     df["bb_mid"] = df["close"].rolling(20).mean()
@@ -984,20 +1008,21 @@ def generate_swing_signals(market, params: Params, strategy: StrategyConfig, sig
     price_pos = (current_price - recent_low) / price_range if price_range > 0 else 0.5
     
     rsi_ok = sig_cfg.rsi_min < rsi < sig_cfg.rsi_max
-    rsi_os = rsi < sig_cfg.rsi_oversold
+    rsi_os = (rsi < sig_cfg.rsi_oversold) and (rsi > prev["rsi"])
     
     vol_ok = last["volume"] > last["volume_ma"] * sig_cfg.volume_confirm_mult
     vol_strong = last["volume"] > last["volume_ma"] * sig_cfg.volume_strong_mult
     
     bb_lo_touch = current_price <= last["bb_lower"] * (1 + sig_cfg.bb_lower_touch_pct)
     bb_mid_abv = current_price > last["bb_mid"]
+    extreme_dip = (not trend_up) and (rsi < 30) and (current_price < last["bb_lower"])
     
     # 진입 금지 조건
     if price_pos > sig_cfg.price_pos_block:
         return {"signal": "hold", "reason": "price_too_high"}
     if rsi > sig_cfg.rsi_overbought:
         return {"signal": "hold", "reason": "rsi_overbought"}
-    if not trend_up:
+    if not trend_up and not extreme_dip:
         return {"signal": "hold", "reason": "downtrend"}
     if not vol_ok:
         return {"signal": "hold", "reason": "low_volume"}
@@ -1012,16 +1037,22 @@ def generate_swing_signals(market, params: Params, strategy: StrategyConfig, sig
                     last["close"] > last["ma_fast"] and
                     last["close"] > last["open"]
                 )
-                if ma_touch and rsi_ok and vol_ok:
-                    sl = ma_fast - atr * sig_cfg.atr_stop_p1
-                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p1:
-                        return {"signal": "buy", "price": float(current_price),
-                               "stop": float(sl), "atr": float(atr),
-                               "reason": "ma_support_bounce", "confidence": 0.9}
+                # vol_ok → vol_strong 으로 강화: 평균 거래량의 1.5배 이상만 통과
+                if ma_touch and rsi_ok and vol_strong:
+                    # 추가 필터: MA 위 안착 확인 (이전 봉도 MA 위에 있어야 함)
+                    prev_above_ma = prev["close"] > prev["ma_fast"] * 0.998
+                    if not prev_above_ma:
+                        pass  # 직전 봉이 MA 아래면 신호 무효
+                    else:
+                        sl = ma_fast - atr * sig_cfg.atr_stop_p1
+                        if sl > 0 and sl < current_price * sig_cfg.stop_margin_p1:
+                            return {"signal": "buy", "price": float(current_price),
+                                    "stop": float(sl), "atr": float(atr),
+                                    "reason": "ma_support_bounce", "confidence": 0.9}
         
         # Pattern 2: Oversold Reversal
         elif pat_id == 2 and sig_cfg.use_pattern_2:
-            if trend_up and rsi_os and bb_lo_touch:
+            if rsi_os and bb_lo_touch:
                 strong_candle = (last["close"] - last["open"]) > atr * sig_cfg.candle_strength_mult
                 if strong_candle and vol_strong:
                     sl = last["low"] - atr * sig_cfg.atr_stop_p2
@@ -1043,17 +1074,50 @@ def generate_swing_signals(market, params: Params, strategy: StrategyConfig, sig
         
         # Pattern 4: Golden Cross
         elif pat_id == 4 and sig_cfg.use_pattern_4:
-            ma_cross = (
-                ma_fast > ma_slow and
-                prev["ma_fast"] <= prev["ma_slow"] and
-                last["close"] > last["ma_fast"]
-            )
-            if ma_cross and rsi_ok and bb_mid_abv and vol_strong:
-                sl = ma_slow - atr * sig_cfg.atr_stop_p4
-                if sl > 0 and sl < current_price * sig_cfg.stop_margin_p4:
-                    return {"signal": "buy", "price": float(current_price),
-                           "stop": float(sl), "atr": float(atr),
-                           "reason": "golden_cross", "confidence": 0.8}
+            # 1H 봉 데이터 로드 (30분봉 대신)
+            df_1h = db_get_candles(market, "1h", limit=100)
+
+            if len(df_1h) >= params.trend_ma_slow + 5:
+                # 1H 기준 MA 계산
+                ma_fast_1h = df_1h["close"].rolling(params.trend_ma_fast).mean()
+                ma_slow_1h = df_1h["close"].rolling(params.trend_ma_slow).mean()
+
+                last_1h  = df_1h.iloc[-1]
+                prev_1h  = df_1h.iloc[-2]
+
+                # 1H 골든크로스: 직전 봉에서 fast < slow → 현재 봉에서 fast > slow
+                ma_cross_1h = (
+                    float(ma_fast_1h.iloc[-1]) > float(ma_slow_1h.iloc[-1]) and
+                    float(ma_fast_1h.iloc[-2]) <= float(ma_slow_1h.iloc[-2])
+                )
+
+                # 30분봉 추가 확인 (1H 크로스 + 30분봉 추세 일치 시 진입)
+                trend_confirm_30m = (ma_fast > ma_slow)  # 상단에서 계산된 30분봉 MA
+
+                if ma_cross_1h and trend_confirm_30m and rsi_ok and vol_strong:
+                    sl = float(ma_slow_1h.iloc[-1]) - atr * sig_cfg.atr_stop_p4
+                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p4:
+                        return {
+                            "signal": "buy",
+                            "price": float(current_price),
+                            "stop": float(sl),
+                            "atr": float(atr),
+                            "reason": "golden_cross_1h",   # reason 이름 구분
+                            "confidence": 0.85             # 1H 기반이라 confidence 상향
+                        }
+            else:
+                # 1H 데이터 부족 시 기존 30분봉 로직 fallback
+                ma_cross = (
+                    ma_fast > ma_slow and
+                    prev["ma_fast"] <= prev["ma_slow"] and
+                    last["close"] > last["ma_fast"]
+                )
+                if ma_cross and rsi_ok and bb_mid_abv and vol_strong:
+                    sl = ma_slow - atr * sig_cfg.atr_stop_p4
+                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p4:
+                        return {"signal": "buy", "price": float(current_price),
+                                "stop": float(sl), "atr": float(atr),
+                                "reason": "golden_cross", "confidence": 0.8}
         
         # Pattern 5: V Reversal
         elif pat_id == 5 and sig_cfg.use_pattern_5:
@@ -1070,6 +1134,15 @@ def generate_swing_signals(market, params: Params, strategy: StrategyConfig, sig
                         return {"signal": "buy", "price": float(current_price),
                                "stop": float(sl), "atr": float(atr),
                                "reason": "v_reversal", "confidence": 0.75}
+        
+        # Pattern 6: Mean Reversion (역추세 단타)
+        elif pat_id == 6:
+            # 급락(장대음봉) 후 거래량이 터지며 꼬리를 달고 올라올 때
+            if rsi < 25 and current_price < last["bb_lower"] * 0.98 and vol_strong:
+                sl = current_price - atr * 1.5
+                return {"signal": "buy", "price": float(current_price),
+                        "stop": float(sl), "atr": float(atr),
+                        "reason": "extreme_mean_reversion", "confidence": 0.9}
     
     return {"signal": "hold", "reason": "no_setup"}
 
@@ -1248,113 +1321,248 @@ def execute_order(market: str, direction: str, price: float, size: float, risk_c
 
 
 # ============================================================
-# AI Config 갱신 (영어 프롬프트)
+# [1단계] 시장 분석가 (Market Analyst)
 # ============================================================
+def ai_analyze_market_regime() -> str:
+    """
+    [1단계: 시장 분석가]
+    비트코인(KRW-BTC)의 최근 30분봉을 분석하여 현재 시장 장세를 판단합니다.
+    이 데이터는 2단계(전략 사령관)의 파라미터 조절 근거로 사용됩니다.
+    """
+    if not CFG.ollama_url or not CFG.ollama_model:
+        return "Unknown Regime (Ollama not configured)"
+        
+    try:
+        # 비트코인 30분봉 최근 20개 가져오기
+        btc_df = db_get_candles("KRW-BTC", "30m", limit=20)
+        if btc_df is None or btc_df.empty:
+            return "Unknown Regime (No BTC data)"
+            
+        # AI가 읽기 쉽게 데이터 텍스트화
+        chart_text = ""
+        for i, row in btc_df.iterrows():
+            change = (row['close'] - row['open']) / row['open'] * 100
+            chart_text += f"- Close: {row['close']:,.0f} | Change: {change:+.2f}% | Vol: {row['volume']:.2f}\n"
+            
+        prompt = f"""
+        You are a Master Crypto Market Analyst.
+        Analyze the recent 30-minute candle data for Bitcoin (KRW-BTC) below.
+        
+        Recent BTC Data:
+        {chart_text}
+        
+        Task:
+        Determine the current macro market regime from the following options:
+        [Strong Uptrend, Weak Uptrend, Sideways/Choppy, Weak Downtrend, Strong Downtrend, Extreme Volatility]
+        
+        Respond ONLY in the following exact JSON format. Do NOT wrap in markdown code blocks:
+        {{
+            "regime": "selected option here",
+            "reason": "1 concise sentence explaining why"
+        }}
+        """
+        
+        # Ollama API 호출 (JSON 포맷 강제 및 온도 조절 적용)
+        resp = requests.post(
+            CFG.ollama_url,
+            json={
+                "model": CFG.ollama_model, 
+                "prompt": prompt, 
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": 0.1, 
+                    "top_p": 0.9
+                }
+            },
+            timeout=60
+        )
+        response_text = resp.json().get("response", "{}")
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group())
+        else:
+            logger.error("JSON 파싱 실패")
+        
+        regime = parsed.get("regime", "Unknown")
+        reason = parsed.get("reason", "No reason provided")
+        
+        result_str = f"Regime: {regime} | Reason: {reason}"
+        logger.info(f"[AI Market Analyst] {result_str}")
+        return result_str
+        
+    except Exception as e:
+        logger.error(f"[AI Market Analyst] 분석 실패: {e}")
+        return "Unknown Regime (Error occurred)"
 
+# ============================================================
+# [2단계] 전략 사령관 (The Strategist)
+# ============================================================
 def ai_refresh_all_configs(ai_cfg: AIConfig, perf: dict) -> tuple:
-    """Ollama AI를 통해 모든 설정을 통합 업데이트 (영어 프롬프트)"""
+    """
+    [2단계: 전략 사령관]
+    시장 분석가의 리포트를 바탕으로 AI 설정을 통합 업데이트합니다.
+    """
     if not CFG.ollama_url or not CFG.ollama_model:
         logger.warning("[AI] Ollama not configured — skipping config update")
         return ai_cfg, "(Ollama not configured)"
     
+    # 1. 시장 분석가 호출 (현재 장세 파악)
+    market_context = ai_analyze_market_regime()
+    
     current_json = json.dumps(ai_cfg.to_dict(), ensure_ascii=False, indent=2)
     
     prompt = f"""
-You are an AI cryptocurrency swing trading bot parameter optimization expert.
-You are trading on Bithumb Exchange using 30-minute candle data for KRW markets.
-
-## Current Performance Metrics
-- Total Trades: {perf.get("total_trades", 0)}
-- Win Rate: {perf.get("win_rate", 0)*100:.1f}%
-- Profit Factor: {perf.get("profit_factor", 0):.2f}
-- Total PnL: {perf.get("total_pnl", 0):+,.0f} KRW
-- Average Holding Time: {perf.get("avg_holding_hours", 0):.1f} hours
-- Average Profit: {perf.get("avg_profit", 0):+,.0f} KRW
-- Average Loss: {abs(perf.get("avg_loss", 0)):,.0f} KRW
-- Total Fees: {perf.get("total_fees", 0):,.0f} KRW
-
-## Current Configuration (JSON)
-{current_json}
-
-## Adjustable Parameter Ranges
-
-### params
-risk_per_trade: 0.010~0.080 | max_positions: 1~5
-trend_ma_fast: 5~30 | trend_ma_slow: 30~120
-cooldown_minutes: 15~240 | atr_mult_stop: 1.0~5.0
-
-### strategy
-max_loss_per_trade: 0.008~0.050 | take_profit_pct: 0.010~0.100
-time_stop_hours: 6~120 | trailing_stop_profit_threshold: 0.008~0.050
-min_volume_mult: 0.5~3.0
-
-### signal (AI-controlled)
-rsi_min: 15~45 | rsi_max: 50~80 | rsi_oversold: 20~45 | rsi_overbought: 60~85
-price_pos_min: 0.05~0.40 | price_pos_max: [min+0.05]~0.70 | price_pos_block: 0.60~0.98
-price_pos_lookback: 5~30 | trend_strong_pct: 0.003~0.08
-volume_confirm_mult: 0.3~1.5 | volume_strong_mult: 1.0~4.0
-bb_lower_touch_pct: 0.00~0.05 | candle_strength_mult: 0.1~2.0 | big_candle_mult: 0.3~3.0
-atr_stop_p1~p5: 0.3~4.0 (ATR stop multiplier per pattern)
-stop_margin_p1~p5: 0.90~0.99 (stop safety margin per pattern)
-use_pattern_1~5: true/false (pattern activation)
-pattern_priority: [1~5 permutation] (check priority order, e.g., [3,1,2,4,5])
-
-### risk (AI-controlled)
-trail_atr_mult: 1.0~5.0 | pullback_exit_pct: 0.005~0.08 | pullback_lookback: 3~30
-cooldown_after_loss: 30~360 | cooldown_after_win: 5~120 | cooldown_default: 1~30
-invest_capital_pct: 0.20~0.90 | risk_multiplier: 2.0~20.0
-order_wait_sec: 5~120 | market_order_buffer: 1.00~1.30 | available_krw_safety: 0.70~0.99
-
-## Analysis and Adjustment Guidelines
-
-1. Win Rate < 40%: Strengthen RSI filter (lower rsi_max), narrow price_pos range
-2. Win Rate > 60%: Relax entry conditions, consider increasing max_positions
-3. Profit Factor < 1.5: Expand take_profit or reduce max_loss
-4. Avg Holding < 10h: Increase time_stop_hours, expand trail_atr_mult
-5. Trade Count < 3: Relax entry conditions (raise price_pos_block, raise rsi_max)
-6. Trade Count > 20: Tighten conditions, increase cooldown
-7. If losses exceed profits: Reduce atr_stop multipliers, adjust stop_margin
-8. pattern_priority: Place better-performing patterns first
-9. If fees exceed 20% of PnL: Set minimum take_profit_pct to at least 0.02
-
-You MUST respond ONLY in the following JSON format (explanations only in changes_summary):
-
-{{
-  "params": {{ ... }},
-  "strategy": {{ ... }},
-  "signal": {{ ... }},
-  "risk": {{ ... }},
-  "changes_summary": "Brief summary of changes in English"
-}}
-"""
+    You are an AI cryptocurrency trading strategy commander.
+    You trade on Bithumb using 30-minute candles.
+    
+    ## Current Market Context (From Market Analyst)
+    {market_context}
+    
+    ## Current Performance Metrics
+    - Total Trades: {perf.get("total_trades", 0)}
+    - Win Rate: {perf.get("win_rate", 0)*100:.1f}%
+    - Profit Factor: {perf.get("profit_factor", 0):.2f}
+    - Total PnL: {perf.get("total_pnl", 0):+,.0f} KRW
+    
+    ## Current Configuration
+    {current_json}
+    
+    ## Strategy Adjustments based on Market Context:
+    - If 'Sideways/Choppy' or 'Downtrend': You MUST lower `take_profit_pct` (e.g., 0.005~0.015), tighten `trailing_stop_profit_threshold`, and reduce `risk_per_trade`. Set `atr_mult_stop` to be tighter.
+    - If 'Uptrend': Expand `take_profit_pct` (e.g., 0.02~0.05) to ride the trend.
+    - If 'Win Rate < 40%': Strengthen RSI filters (lower rsi_max, tighten price_pos block).
+    
+    ## Parameter Limits
+    take_profit_pct: 0.005~0.080 | max_loss_per_trade: 0.008~0.040
+    trailing_stop_profit_threshold: 0.005~0.030
+    rsi_min: 15~40 | rsi_max: 50~75 | rsi_oversold: 20~40
+    
+    Respond ONLY in the exact JSON format below. Do NOT use markdown formatting (no ```json).
+    {{
+      "params": {{ ... }},
+      "strategy": {{ ... }},
+      "signal": {{ ... }},
+      "risk": {{ ... }},
+      "changes_summary": "English summary of adjustments focusing on market adaptation"
+    }}
+    """
     
     try:
         resp = requests.post(
             CFG.ollama_url,
-            json={"model": CFG.ollama_model, "prompt": prompt, "stream": False},
+            json={
+                "model": CFG.ollama_model, 
+                "prompt": prompt, 
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": 0.1, 
+                    "top_p": 0.9
+                }
+            },
             timeout=180
         )
-        response_text = resp.json().get("response", "")
-        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
-        if not json_match:
-            return ai_cfg, "(AI response parsing failed)"
+        response_text = resp.json().get("response", "{}")
         
-        parsed = json.loads(json_match.group())
+        parsed = json.loads(response_text)
         summary = parsed.pop("changes_summary", "(No changes)")
+        
         new_cfg = AIConfig.from_dict(parsed)
         new_cfg = validate_and_clamp_config(new_cfg)
         new_cfg.save_to_db()
         save_ai_change_summary(summary)
-        logger.info(f"[AI] Config updated: {summary[:100]}")
+        
+        logger.info(f"[AI Strategist] Config updated based on context: {summary[:100]}")
         return new_cfg, summary
     except Exception as e:
-        logger.error(f"[AI] Config update error: {e}")
+        logger.error(f"[AI Strategist] Update error: {e}")
         return ai_cfg, f"(Error: {e})"
+
+# ============================================================
+# [3단계] 매수 검문관 (The Gatekeeper)
+# ============================================================
+def ai_verify_buy_signal(market: str, current_price: float, df: pd.DataFrame, signal_reason: str) -> dict:
+    """
+    [3단계: 매수 검문관]
+    발생한 매수 신호가 하락장 속 속임수(Fakeout)인지, 진짜 진입 기회인지 최종 승인합니다.
+    """
+    if not CFG.ollama_url or not CFG.ollama_model_fast:
+        return {"decision": "APPROVE", "reason": "AI Not Configured - Auto Approve"}
+        
+    try:
+        # 최근 15개 캔들의 흐름을 문자열로 변환
+        recent_candles = df.tail(15)
+        chart_text = ""
+        for i, row in recent_candles.iterrows():
+            change = (row['close'] - row['open']) / row['open'] * 100
+            # 거래량 대비 이동평균선(20) 비율
+            vol_ratio = row['volume'] / row['volume_ma'] if pd.notna(row['volume_ma']) and row['volume_ma'] > 0 else 1.0
+            chart_text += f"- Close: {row['close']:,.0f} | Change: {change:+.2f}% | VolRatio: {vol_ratio:.1fx} | RSI: {row['rsi']:.1f}\n"
+
+        prompt = f"""
+        You are a highly conservative Risk Manager for a crypto fund.
+        The trading algorithm just triggered a BUY signal for {market} based on the strategy: '{signal_reason}'.
+        Current Price is {current_price:,.0f}.
+        
+        Analyze the recent 15 candle sequence below to prevent buying into a trap (whipsaw/fakeout).
+        
+        Recent Price Action:
+        {chart_text}
+        
+        Rules:
+        1. If the price is continuously dropping with red candles and weak volume, REJECT.
+        2. If this looks like a dead-cat bounce (brief green candle after massive drop without volume), REJECT.
+        3. If there is a solid support, oversold RSI stabilization, or strong volume breakout, APPROVE.
+        
+        Respond ONLY with a valid raw JSON object. Do NOT use markdown code blocks (```json).
+        Do NOT add any greetings or explanations outside the JSON.
+        {
+        "decision": "APPROVE" or "REJECT",
+        "reason": "1 short sentence explaining the risk assessment"
+        }
+        """
+
+        resp = requests.post(CFG.ollama_url, json={
+            "model": CFG.ollama_model_fast,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": 0.0,
+                "top_p": 0.9,
+                "num_predict": 100
+            }
+        }, timeout=10)
+        
+        response_text = resp.json().get("response", "{}")
+        
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group(0))
+        else:
+            parsed = json.loads(response_text) # Fallback
+            
+        decision = parsed.get("decision", "REJECT").upper()
+        reason = parsed.get("reason", "Failed to parse reason")
+
+        
+        # 포맷 에러 등으로 APPROVE가 명확하지 않으면 거절 처리
+        if decision not in ["APPROVE", "REJECT"]:
+            decision = "REJECT"
+            
+        logger.info(f"[AI Gatekeeper] {market} Buy Signal -> {decision} (Reason: {reason})")
+        return {"decision": decision, "reason": reason}
+
+    except Exception as e:
+        logger.error(f"[AI Gatekeeper] 검증 중 에러 발생: {e}")
+        # 에러 발생 시 안전하게 매수 거부
+        return {"decision": "REJECT", "reason": f"Gatekeeper Error: {e}"}
+
 
 # ============================================================
 # 메인 루프
 # ============================================================
-
 def run():
     global AI_CFG
     logger.info("=" * 60)
@@ -1477,7 +1685,7 @@ def run():
                     last_entries_raw = db_get_meta("last_entries", "{}")
                     last_entries = json.loads(last_entries_raw)
                     current_time = time.time()
-                    
+
                     for market, signal in signals[:slots]:
                         if market in last_entries:
                             elapsed = (current_time - last_entries[market]) / 60
@@ -1485,19 +1693,70 @@ def run():
                             if not recent.empty:
                                 last_exit = recent.iloc[0]["exit_reason"]
                                 if last_exit in ("max_loss", "stop_loss"):
-                                    min_wait = risk_cfg.cooldown_after_loss
+                                    min_wait = riskcfg.cooldown_after_loss    # 90분 (손절 후)
                                 elif last_exit == "take_profit":
-                                    min_wait = risk_cfg.cooldown_after_win
+                                    min_wait = riskcfg.cooldown_after_win     # 15분 (익절 후)
                                 else:
-                                    min_wait = risk_cfg.cooldown_default
+                                    # time_stop, pullback_from_profit, force_exit 등 중립 청산 후
+                                    # 기존 cooldown_default(5분) → params.cooldown_minutes(기본 90분) 로 연결
+                                    min_wait = params.cooldown_minutes
                             else:
-                                min_wait = risk_cfg.cooldown_default
-                            
+                                # 거래 이력이 아예 없는 코인(신규 진입 시도)은 짧은 대기 유지
+                                min_wait = riskcfg.cooldown_default           # 5분 유지
                             if elapsed < min_wait:
-                                logger.info(f"[COOLDOWN] {market} {elapsed:.0f}/{min_wait}min")
+                                logger.info(
+                                    f"[COOLDOWN] {market} {elapsed:.0f}/{min_wait}min "
+                                    f"(reason={recent.iloc[0]['exit_reason'] if not recent.empty else 'no_history'})"
+                                )
                                 continue
                         
+                        # =========================================================
+                        # [추가됨] 3단계 검문관(Gatekeeper) 호출 로직
+                        # =========================================================
                         entry_price = signal["price"]
+                        signal_reason = signal.get("reason", "unknown")
+                        
+                        # 매수 대상 코인의 30분봉 데이터 불러오기 (검문용)
+                        df_verify = db_get_candles(market, "30m", limit=300)
+                        
+                        if not df_verify.empty:
+                            # 보조 지표 계산 (프롬프트에 넘겨줄 데이터)
+                            df_verify["volume_ma"] = df_verify["volume"].rolling(20).mean()
+                            delta = df_verify["close"].diff()
+                            # Wilder의 EMA 방식
+                            gain = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean()
+                            loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14).mean()
+                            df_verify["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
+                            
+                            # 3단계 검문관 승인/거절 판별
+                            gate_result = ai_verify_buy_signal(market, signal, df_verify, AI_CFG)
+                            if gate_result == "reject":
+                                logger.info(f"[GATE] {market} AI 검문 거부 → 매수 취소")
+                                continue
+                            
+                            if gate_result.get("decision") != "APPROVE":
+                                logger.info(f"[GATEKEEPER REJECT] {market} 매수 취소 사유: {gate_result.get('reason')}")
+                                continue  # 검문 실패 시 아래 매수 코드를 건너뛰고 다음 코인으로 넘어감
+                            else:
+                                logger.info(f"[GATEKEEPER APPROVE] {market} 매수 승인: {gate_result.get('reason')}")
+                        else:
+                            # 캔들 데이터 없을 때 신호 confidence 기준으로 자동 판단
+                            confidence = signal.get("confidence", 0.0)
+                            AUTO_APPROVE_THRESHOLD = 0.90   # 높은 확신도일 때만 통과
+
+                            if confidence >= AUTO_APPROVE_THRESHOLD:
+                                logger.warning(
+                                    f"[GATE] {market} 캔들 없음 → confidence={confidence:.2f} "
+                                    f">= {AUTO_APPROVE_THRESHOLD} → Gatekeeper 자동 승인"
+                                )
+                                # 통과 → 아래 매수 로직으로 진행
+                            else:
+                                logger.warning(
+                                    f"[GATE] {market} 캔들 없음 → confidence={confidence:.2f} "
+                                    f"< {AUTO_APPROVE_THRESHOLD} → 매수 취소"
+                                )
+                                continue
+                        
                         total_cap = avail_krw
                         
                         invest = min(
