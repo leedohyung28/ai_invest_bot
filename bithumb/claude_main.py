@@ -17,7 +17,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 import threading, sys
-import re
+from collections import Counter
 
 load_dotenv()
 
@@ -143,10 +143,12 @@ def send_email_and_rotate_log():
                 part.add_header('Content-Disposition', f'attachment; filename={file_to_send}')
                 msg.attach(part)
             server = smtplib.SMTP('smtp.gmail.com', 587)
-            server.starttls()
-            server.login(GMAIL_USER, GMAIL_PASSWORD)
-            server.send_message(msg)
-            server.quit()
+            try:
+                server.starttls()
+                server.login(GMAIL_USER, GMAIL_PASSWORD)
+                server.send_message(msg)
+            finally:
+                server.quit()
             logger.info(f"이메일 전송 성공: {file_to_send} -> {TARGET_EMAIL}")
             last_portfolio_value = current_value
             last_email_time = time.time()
@@ -173,53 +175,53 @@ last_email_time = 0
 @dataclass
 class Params:
     """거래 전략 기본 파라미터"""
-    max_positions: int = 4
-    max_coin_weight: float = 0.6
-    risk_per_trade: float = 0.035
-    position_allocation_pct: float = 0.65
-    atr_mult_stop: float = 3.0
+    max_positions: int = 5              
+    max_coin_weight: float = 0.5       
+    risk_per_trade: float = 0.02        
+    position_allocation_pct: float = 0.9
+    atr_mult_stop: float = 2.0          
     breakout_lookback: int = 2
-    trend_ma_fast: int = 20
-    trend_ma_slow: int = 50
-    cooldown_minutes: int = 90
-    min_volume_mult: float = 1.2
+    trend_ma_fast: int = 20            
+    trend_ma_slow: int = 60 
+    cooldown_minutes: int = 30
+    min_volume_mult: float = 0.8
 
 @dataclass
 class StrategyConfig:
     """전략 종료 조건 파라미터"""
-    use_trend_filter: bool = True
+    use_trend_filter: bool = False
     use_volume_filter: bool = True
     use_volatility_filter: bool = False
-    min_volume_mult: float = 1.3
-    volatility_mult: float = 0.9
-    trailing_stop_profit_threshold: float = 0.018
-    max_loss_per_trade: float = 0.022
-    take_profit_pct: float = 0.040
-    time_stop_hours: float = 48.0
+    min_volume_mult: float = 0.8
+    volatility_mult: float = 0.8
+    trailing_stop_profit_threshold: float = 0.015
+    max_loss_per_trade: float = 0.015
+    take_profit_pct: float = 0.035
+    time_stop_hours: float = 6.0
 
 @dataclass
 class SignalConfig:
     """신호 생성 파라미터"""
     # RSI
-    rsi_min: float = 30.0
-    rsi_max: float = 65.0
+    rsi_min: float = 20.0
+    rsi_max: float = 85.0
     rsi_oversold: float = 35.0
-    rsi_overbought: float = 70.0
+    rsi_overbought: float = 72.0
     # 가격 포지션
-    price_pos_min: float = 0.2
-    price_pos_max: float = 0.4
-    price_pos_block: float = 0.8
-    price_pos_lookback: int = 10
+    price_pos_min: float = 0.10
+    price_pos_max: float = 0.80
+    price_pos_block: float = 0.92
+    price_pos_lookback: int = 20
     # 추세
-    trend_strong_pct: float = 0.02
+    trend_strong_pct: float = 0.015
     # 거래량
-    volume_confirm_mult: float = 0.9
-    volume_strong_mult: float = 1.5
+    volume_confirm_mult: float = 0.55
+    volume_strong_mult: float = 1.3
     # BB
-    bb_lower_touch_pct: float = 0.02
+    bb_lower_touch_pct: float = 0.03
     # 캔들 강도
-    candle_strength_mult: float = 0.5
-    big_candle_mult: float = 1.0
+    candle_strength_mult: float = 0.4
+    big_candle_mult: float = 0.8
     # ATR 손절 배수
     atr_stop_p1: float = 1.5
     atr_stop_p2: float = 1.2
@@ -250,17 +252,21 @@ class RiskConfig:
     pullback_exit_pct: float = 0.02
     pullback_lookback: int = 10
     # 쿨다운
-    cooldown_after_loss: int = 90
-    cooldown_after_win: int = 15
+    cooldown_after_loss: int = 30
+    cooldown_after_win: int = 5
     cooldown_default: int = 5
     # 포지션 사이징
-    invest_capital_pct: float = 0.55
+    invest_capital_pct: float = 0.85
     risk_multiplier: float = 4.0
     # 주문 실행
     order_wait_sec: int = 90
     market_order_buffer: float = 1.1
     available_krw_safety: float = 0.95
     min_order_mult: float = 1.0
+    # Gatekeeper / 슬립 제어
+    auto_pass_confidence: float = 0.82
+    min_gate_confidence: float = 0.55
+    max_sleep_sec: int = 300
 
 @dataclass
 class Config:
@@ -271,8 +277,8 @@ class Config:
     ollama_model_fast: str = os.getenv("OLLAMA_MODEL_FAST", os.getenv("OLLAMA_MODEL")) 
     quote: str = "KRW"
     exclude: tuple = ("BTC", "ETH")
-    universe_size: int = 300
-    collect_interval_sec: int = 300
+    universe_size: int = 80
+    collect_interval_sec: int = 60
     ai_refresh_min: int = 30
     fee_rate: float = 0.0004
     min_order_krw: float = 7000
@@ -335,6 +341,10 @@ class AIConfig:
 CFG = Config()
 AI_CFG = AIConfig()
 
+NO_SIGNAL_STREAK     = 0
+HOLD_REASON_COUNTS   = Counter()
+GATE_REJECT_REASON_COUNTS = Counter()
+
 # ============================================================
 # AI Config 범위 검증 함수
 # ============================================================
@@ -361,20 +371,20 @@ def validate_and_clamp_config(cfg: AIConfig) -> AIConfig:
     s.take_profit_pct = max(0.010, min(0.100, s.take_profit_pct))
     if s.take_profit_pct <= s.max_loss_per_trade:
         s.take_profit_pct = s.max_loss_per_trade * 1.6
-    s.time_stop_hours = max(6.0, min(120.0, s.time_stop_hours))
+    s.time_stop_hours = max(2.0, min(12.0, s.time_stop_hours))
     s.trailing_stop_profit_threshold = max(0.008, min(0.050, s.trailing_stop_profit_threshold))
     s.min_volume_mult = max(0.5, min(3.0, s.min_volume_mult))
     
     # ── SignalConfig ──
     sg.rsi_min = max(15.0, min(45.0, sg.rsi_min))
-    sg.rsi_max = max(50.0, min(80.0, sg.rsi_max))
+    sg.rsi_max = max(50.0, min(90.0, sg.rsi_max))
     sg.rsi_oversold = max(20.0, min(45.0, sg.rsi_oversold))
     sg.rsi_overbought = max(60.0, min(85.0, sg.rsi_overbought))
     if sg.rsi_min >= sg.rsi_max: 
         sg.rsi_max = sg.rsi_min + 20
     sg.price_pos_min = max(0.05, min(0.40, sg.price_pos_min))
-    sg.price_pos_max = max(sg.price_pos_min + 0.05, min(0.70, sg.price_pos_max))
-    sg.price_pos_block = max(0.60, min(0.98, sg.price_pos_block))
+    sg.price_pos_max = max(sg.price_pos_min + 0.10, min(0.95, sg.price_pos_max))
+    sg.price_pos_block = max(0.70, min(0.99, sg.price_pos_block))
     sg.price_pos_lookback = max(5, min(30, int(sg.price_pos_lookback)))
     sg.trend_strong_pct = max(0.003, min(0.08, sg.trend_strong_pct))
     sg.volume_confirm_mult = max(0.3, min(1.5, sg.volume_confirm_mult))
@@ -388,11 +398,11 @@ def validate_and_clamp_config(cfg: AIConfig) -> AIConfig:
     for attr in ["stop_margin_p1", "stop_margin_p2", "stop_margin_p3", "stop_margin_p4", "stop_margin_p5"]:
         setattr(sg, attr, max(0.90, min(0.99, getattr(sg, attr))))
     
-    valid = set(range(1, 6))
+    valid_6 = set(range(1, 7))
     if not (isinstance(sg.pattern_priority, list) and 
-            set(sg.pattern_priority) == valid and 
-            len(sg.pattern_priority) == 5):
-        sg.pattern_priority = [3, 1, 2, 4, 5]
+            set(sg.pattern_priority) == valid_6 and 
+            len(sg.pattern_priority) == 6):
+        sg.pattern_priority = [3, 1, 2, 4, 5, 6]
     
     # ── RiskConfig ──
     r.trail_atr_mult = max(1.0, min(5.0, r.trail_atr_mult))
@@ -407,7 +417,11 @@ def validate_and_clamp_config(cfg: AIConfig) -> AIConfig:
     r.market_order_buffer = max(1.00, min(1.30, r.market_order_buffer))
     r.available_krw_safety = max(0.70, min(0.99, r.available_krw_safety))
     r.min_order_mult = max(0.5, min(5.0, r.min_order_mult))
-    
+    r.auto_pass_confidence = max(0.80, min(0.99, r.auto_pass_confidence))
+    r.min_gate_confidence  = max(0.50, min(0.90, r.min_gate_confidence))
+    if r.min_gate_confidence >= r.auto_pass_confidence:
+        r.min_gate_confidence = r.auto_pass_confidence - 0.10  # 역전 방지
+    r.max_sleep_sec = max(60, min(300, int(r.max_sleep_sec)))
     return cfg
 
 # ============================================================
@@ -737,7 +751,7 @@ class BithumbPublic:
             logger.error(f"[ERROR] 마켓 코드 조회 실패: {e}")
             return []
     
-    def get_day_candles(self, market: str, count: int = 300, to: str = None):
+    def get_30m_candles(self, market: str, count: int = 300, to: str = None):
         url = f"{self.base_url}/v1/candles/minutes/30"
         params = {
             "market": market,
@@ -751,6 +765,17 @@ class BithumbPublic:
             return resp.json()
         except Exception as e:
             logger.error(f"[ERROR] {market} 캔들 조회 실패: {e}")
+            return []
+    
+    def get_15m_candles(self, market: str, count: int = 300):
+        url = f"{self.base_url}/v1/candles/minutes/15"
+        params = {"market": market, "count": min(count, 300)}
+        try:
+            resp = self.sess.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"[ERROR] {market} 15m 캔들 조회 실패: {e}")
             return []
     
     def get_current_price(self, market: str):
@@ -941,8 +966,15 @@ def collect_candles(markets):
         if is_excluded_coin(market):
             continue
         try:
-            # 기존 30분봉
-            candles_30m = pub.get_day_candles(market, count=300)
+            # 15분봉
+            candles_15m = pub.get_15m_candles(market, count=300)
+            if candles_15m:
+                rows_15m = parse_candles_to_rows(candles_15m, market, "15m")
+                if rows_15m:
+                    db_put_candles(rows_15m)
+            
+            # 30분봉
+            candles_30m = pub.get_30m_candles(market, count=300)
             if candles_30m:
                 rows = parse_candles_to_rows(candles_30m, market, "30m")
                 if rows:
@@ -962,189 +994,89 @@ def collect_candles(markets):
 # ============================================================
 # 신호 생성 (SignalConfig 적용)
 # ============================================================
-
 def generate_swing_signals(market, params: Params, strategy: StrategyConfig, sig_cfg: SignalConfig) -> dict:
-    """스윙 트레이딩 신호 생성"""
     if is_excluded_coin(market):
         return {"signal": "hold", "reason": "excluded_coin"}
-    
-    df = db_get_candles(market, "30m", limit=300)
-    if len(df) < max(params.trend_ma_slow, params.breakout_lookback) + 5:
+
+    df_15m = db_get_candles(market, "15m", limit=300)
+    if len(df_15m) < params.trend_ma_slow + 5:
         return {"signal": "hold", "reason": "insufficient_data"}
-    
-    # 지표 계산
-    df["atr"] = calculate_atr(df, 14)
-    df["ma_fast"] = calculate_ma(df, params.trend_ma_fast)
-    df["ma_slow"] = calculate_ma(df, params.trend_ma_slow)
-    df["volume_ma"] = df["volume"].rolling(20).mean()
-    delta = df["close"].diff()
+
+    df_15m["ema_fast"] = df_15m["close"].ewm(span=params.trend_ma_fast, adjust=False).mean()
+    df_15m["ema_slow"] = df_15m["close"].ewm(span=params.trend_ma_slow, adjust=False).mean()
+
+    delta = df_15m["close"].diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    df["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
-    df["bb_mid"] = df["close"].rolling(20).mean()
-    bb_std = df["close"].rolling(20).std()
-    df["bb_upper"] = df["bb_mid"] + bb_std * 2
-    df["bb_lower"] = df["bb_mid"] - bb_std * 2
-    
-    lb = sig_cfg.price_pos_lookback
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
-    current_price = last["close"]
-    atr = last["atr"]
-    ma_fast = last["ma_fast"]
-    ma_slow = last["ma_slow"]
-    rsi = last["rsi"]
-    
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14).mean()
+    df_15m["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
+    df_15m["atr"] = calculate_atr(df_15m, 14)
+
+    df_15m["bb_mid"] = df_15m["close"].rolling(20).mean()
+    bb_std = df_15m["close"].rolling(20).std()
+    df_15m["bb_upper"] = df_15m["bb_mid"] + bb_std * 2
+    df_15m["volume_ma"] = df_15m["volume"].rolling(20).mean()
+
+    last = df_15m.iloc[-1]
+    current_price = float(last["close"])
+    atr = float(last["atr"])
+    rsi = float(last["rsi"])
+
     if current_price is None or current_price <= 0 or atr <= 0 or pd.isna(atr):
         return {"signal": "hold", "reason": "invalid_data"}
-    
-    # 공통 지표
-    trend_up = ma_fast > ma_slow
-    trend_strong = ma_fast > ma_slow * (1 + sig_cfg.trend_strong_pct)
-    recent_high = df["high"].tail(lb).max()
-    recent_low = df["low"].tail(lb).min()
-    price_range = recent_high - recent_low
-    price_pos = (current_price - recent_low) / price_range if price_range > 0 else 0.5
-    
-    rsi_ok = sig_cfg.rsi_min < rsi < sig_cfg.rsi_max
-    rsi_os = (rsi < sig_cfg.rsi_oversold) and (rsi > prev["rsi"])
-    
-    vol_ok = last["volume"] > last["volume_ma"] * sig_cfg.volume_confirm_mult
-    vol_strong = last["volume"] > last["volume_ma"] * sig_cfg.volume_strong_mult
-    
-    bb_lo_touch = current_price <= last["bb_lower"] * (1 + sig_cfg.bb_lower_touch_pct)
-    bb_mid_abv = current_price > last["bb_mid"]
-    extreme_dip = (not trend_up) and (rsi < 30) and (current_price < last["bb_lower"])
-    
-    # 진입 금지 조건
-    if price_pos > sig_cfg.price_pos_block:
-        return {"signal": "hold", "reason": "price_too_high"}
-    if rsi > sig_cfg.rsi_overbought:
-        return {"signal": "hold", "reason": "rsi_overbought"}
-    if not trend_up and not extreme_dip:
+
+    # ✅ 하락장 이유 명시
+    is_uptrend = current_price > last["ema_slow"] * 0.98
+    if not is_uptrend:
         return {"signal": "hold", "reason": "downtrend"}
-    if not vol_ok:
-        return {"signal": "hold", "reason": "low_volume"}
-    
-    # 패턴 체크
-    for pat_id in sig_cfg.pattern_priority:
-        # Pattern 1: MA Support Bounce
-        if pat_id == 1 and sig_cfg.use_pattern_1:
-            if trend_up and not trend_strong:
-                ma_touch = (
-                    prev["low"] <= prev["ma_fast"] <= prev["high"] and
-                    last["close"] > last["ma_fast"] and
-                    last["close"] > last["open"]
-                )
-                # vol_ok → vol_strong 으로 강화: 평균 거래량의 1.5배 이상만 통과
-                if ma_touch and rsi_ok and vol_strong:
-                    # 추가 필터: MA 위 안착 확인 (이전 봉도 MA 위에 있어야 함)
-                    prev_above_ma = prev["close"] > prev["ma_fast"] * 0.998
-                    if not prev_above_ma:
-                        pass  # 직전 봉이 MA 아래면 신호 무효
-                    else:
-                        sl = ma_fast - atr * sig_cfg.atr_stop_p1
-                        if sl > 0 and sl < current_price * sig_cfg.stop_margin_p1:
-                            return {"signal": "buy", "price": float(current_price),
-                                    "stop": float(sl), "atr": float(atr),
-                                    "reason": "ma_support_bounce", "confidence": 0.9}
-        
-        # Pattern 2: Oversold Reversal
-        elif pat_id == 2 and sig_cfg.use_pattern_2:
-            if rsi_os and bb_lo_touch:
-                strong_candle = (last["close"] - last["open"]) > atr * sig_cfg.candle_strength_mult
-                if strong_candle and vol_strong:
-                    sl = last["low"] - atr * sig_cfg.atr_stop_p2
-                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p2:
-                        return {"signal": "buy", "price": float(current_price),
-                               "stop": float(sl), "atr": float(atr),
-                               "reason": "oversold_reversal", "confidence": 0.85}
-        
-        # Pattern 3: Trend Dip Buy
-        elif pat_id == 3 and sig_cfg.use_pattern_3:
-            if (trend_up and
-                sig_cfg.price_pos_min <= price_pos <= sig_cfg.price_pos_max and
-                rsi_ok and last["close"] > last["open"] and vol_ok):
-                sl = recent_low - atr * sig_cfg.atr_stop_p3
-                if sl > 0 and sl < current_price * sig_cfg.stop_margin_p3:
-                    return {"signal": "buy", "price": float(current_price),
-                           "stop": float(sl), "atr": float(atr),
-                           "reason": "trend_dip_buy", "confidence": 0.95}
-        
-        # Pattern 4: Golden Cross
-        elif pat_id == 4 and sig_cfg.use_pattern_4:
-            # 1H 봉 데이터 로드 (30분봉 대신)
-            df_1h = db_get_candles(market, "1h", limit=100)
 
-            if len(df_1h) >= params.trend_ma_slow + 5:
-                # 1H 기준 MA 계산
-                ma_fast_1h = df_1h["close"].rolling(params.trend_ma_fast).mean()
-                ma_slow_1h = df_1h["close"].rolling(params.trend_ma_slow).mean()
+    # ✅ RSI 이유 명시
+    if rsi >= sig_cfg.rsi_max:
+        return {"signal": "hold", "reason": "rsi_too_high"}
+    if rsi <= sig_cfg.rsi_min:
+        return {"signal": "hold", "reason": "rsi_too_low"}
 
-                last_1h  = df_1h.iloc[-1]
-                prev_1h  = df_1h.iloc[-2]
+    dist_to_ema20 = (current_price - last["ema_fast"]) / current_price
+    is_pullback = (
+        abs(dist_to_ema20) <= 0.020 and
+        current_price > last["ema_fast"] and
+        sig_cfg.rsi_min < rsi < sig_cfg.rsi_max
+    )
 
-                # 1H 골든크로스: 직전 봉에서 fast < slow → 현재 봉에서 fast > slow
-                ma_cross_1h = (
-                    float(ma_fast_1h.iloc[-1]) > float(ma_slow_1h.iloc[-1]) and
-                    float(ma_fast_1h.iloc[-2]) <= float(ma_slow_1h.iloc[-2])
-                )
+    # ✅ breakout RSI도 sig_cfg 사용
+    is_breakout = (
+        current_price > last["bb_upper"] and
+        last["volume"] > last["volume_ma"] * sig_cfg.volume_strong_mult and  # ✅ sig_cfg 사용
+        sig_cfg.rsi_oversold < rsi < sig_cfg.rsi_overbought                  # ✅ sig_cfg 사용
+    )
 
-                # 30분봉 추가 확인 (1H 크로스 + 30분봉 추세 일치 시 진입)
-                trend_confirm_30m = (ma_fast > ma_slow)  # 상단에서 계산된 30분봉 MA
+    # ✅ 거래량 부족 이유 명시
+    if not is_pullback and not is_breakout:
+        if last["volume"] < last["volume_ma"] * sig_cfg.volume_confirm_mult:
+            return {"signal": "hold", "reason": "low_volume"}
+        return {"signal": "hold", "reason": "no_pattern_match"}
 
-                if ma_cross_1h and trend_confirm_30m and rsi_ok and vol_strong:
-                    sl = float(ma_slow_1h.iloc[-1]) - atr * sig_cfg.atr_stop_p4
-                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p4:
-                        return {
-                            "signal": "buy",
-                            "price": float(current_price),
-                            "stop": float(sl),
-                            "atr": float(atr),
-                            "reason": "golden_cross_1h",   # reason 이름 구분
-                            "confidence": 0.85             # 1H 기반이라 confidence 상향
-                        }
-            else:
-                # 1H 데이터 부족 시 기존 30분봉 로직 fallback
-                ma_cross = (
-                    ma_fast > ma_slow and
-                    prev["ma_fast"] <= prev["ma_slow"] and
-                    last["close"] > last["ma_fast"]
-                )
-                if ma_cross and rsi_ok and bb_mid_abv and vol_strong:
-                    sl = ma_slow - atr * sig_cfg.atr_stop_p4
-                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p4:
-                        return {"signal": "buy", "price": float(current_price),
-                                "stop": float(sl), "atr": float(atr),
-                                "reason": "golden_cross", "confidence": 0.8}
-        
-        # Pattern 5: V Reversal
-        elif pat_id == 5 and sig_cfg.use_pattern_5:
-            if len(df) >= 5:
-                three_down = (
-                    prev["close"] < prev2["close"] and
-                    prev2["close"] < df.iloc[-4]["close"] and
-                    prev["close"] < prev["open"]
-                )
-                big_green = (last["close"] - last["open"]) > atr * sig_cfg.big_candle_mult
-                if trend_up and three_down and big_green and vol_strong:
-                    sl = min(prev["low"], prev2["low"]) - atr * sig_cfg.atr_stop_p5
-                    if sl > 0 and sl < current_price * sig_cfg.stop_margin_p5:
-                        return {"signal": "buy", "price": float(current_price),
-                               "stop": float(sl), "atr": float(atr),
-                               "reason": "v_reversal", "confidence": 0.75}
-        
-        # Pattern 6: Mean Reversion (역추세 단타)
-        elif pat_id == 6:
-            # 급락(장대음봉) 후 거래량이 터지며 꼬리를 달고 올라올 때
-            if rsi < 25 and current_price < last["bb_lower"] * 0.98 and vol_strong:
-                sl = current_price - atr * 1.5
-                return {"signal": "buy", "price": float(current_price),
-                        "stop": float(sl), "atr": float(atr),
-                        "reason": "extreme_mean_reversion", "confidence": 0.9}
-    
-    return {"signal": "hold", "reason": "no_setup"}
+    signal_type = None
+    if is_pullback:
+        signal_type = "pullback_ema20"
+    elif is_breakout:
+        signal_type = "volatility_breakout"
+
+    if signal_type:
+        sl_price = current_price - (atr * params.atr_mult_stop)
+        if sl_price < current_price * 0.995:
+            return {
+                "signal": "buy",
+                "price": current_price,
+                "stop": float(sl_price),
+                "atr": atr,
+                "reason": signal_type,
+                "confidence": 0.85 if signal_type == "pullback_ema20" else 0.75
+            }
+        else:
+            return {"signal": "hold", "reason": "stop_too_tight"}  # ✅ 이유 추가
+
+    return {"signal": "hold", "reason": "no_pattern_match"}
+
 
 # ============================================================
 # 포지션 청산 (RiskConfig 적용)
@@ -1205,7 +1137,7 @@ def check_position_exit(market: str, current_price: float, position_row,
     
     # 5) Pullback 청산
     if profit_pct >= max(trail_start, 0.008):
-        df = db_get_candles(market, "30m", limit=pb_lookback + 5)
+        df = db_get_candles(market, "15m", limit=pb_lookback + 5)
         if len(df) >= pb_lookback:
             recent_high = float(df["high"].tail(pb_lookback).max())
             if recent_high > 0:
@@ -1216,7 +1148,7 @@ def check_position_exit(market: str, current_price: float, position_row,
     
     # 6) 트레일링 스톱 업데이트
     if direction == "long" and profit_pct >= trail_start:
-        df = db_get_candles(market, "30m", limit=150)
+        df = db_get_candles(market, "15m", limit=150)
         if len(df) >= 14:
             atr_s = calculate_atr(df, 14)
             atr = float(atr_s.iloc[-1]) if len(atr_s) > 0 else 0.0
@@ -1377,12 +1309,21 @@ def ai_analyze_market_regime() -> str:
             },
             timeout=60
         )
-        response_text = resp.json().get("response", "{}")
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        raw_resp = resp.json()
+        if "error" in raw_resp:
+            logger.error(f"[AI Market Analyst] Ollama 오류: {raw_resp['error']}")
+            return f"Unknown Regime (Ollama error: {raw_resp['error']})"
+        response_text = raw_resp.get("response", "")
+        logger.info(f"[AI Market Analyst] Raw: {response_text[:300]}")
+        if not response_text.strip():
+            logger.error("[AI Market Analyst] 응답 비어있음 — OLLAMA_URL(/api/generate) 또는 모델명 확인 필요")
+            return "Unknown Regime (Empty response)"
+        json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
         if json_match:
             parsed = json.loads(json_match.group())
         else:
-            logger.error("JSON 파싱 실패")
+            logger.error(f"[AI Market Analyst] JSON 파싱 실패: {response_text[:300]}")
+            return "Unknown Regime (JSON parse failed)"
         
         regime = parsed.get("regime", "Unknown")
         reason = parsed.get("reason", "No reason provided")
@@ -1403,48 +1344,58 @@ def ai_refresh_all_configs(ai_cfg: AIConfig, perf: dict) -> tuple:
     [2단계: 전략 사령관]
     시장 분석가의 리포트를 바탕으로 AI 설정을 통합 업데이트합니다.
     """
+    # 전역 변수 참조
+    global HOLD_REASON_COUNTS, GATE_REJECT_REASON_COUNTS
+
     if not CFG.ollama_url or not CFG.ollama_model:
         logger.warning("[AI] Ollama not configured — skipping config update")
         return ai_cfg, "(Ollama not configured)"
-    
-    # 1. 시장 분석가 호출 (현재 장세 파악)
+
+    # 1. 시장 분석가 호출
     market_context = ai_analyze_market_regime()
     
+    # [추가] 필터링 통계 생성
+    hold_top = HOLD_REASON_COUNTS.most_common(8)
+    hold_stats_str = "\n".join([f"  - {r}: {c} times" for r, c in hold_top]) if hold_top else "  - (No data)"
+    gate_top = GATE_REJECT_REASON_COUNTS.most_common(5)
+    gate_stats_str = "\n".join([f"  - {r}: {c} times" for r, c in gate_top]) if gate_top else "  - (No data)"
+
     current_json = json.dumps(ai_cfg.to_dict(), ensure_ascii=False, indent=2)
-    
+
     prompt = f"""
     You are an AI cryptocurrency trading strategy commander.
     You trade on Bithumb using 30-minute candles.
-    
-    ## Current Market Context (From Market Analyst)
+
+    ## Current Market Context
     {market_context}
-    
-    ## Current Performance Metrics
+
+    ## Performance
     - Total Trades: {perf.get("total_trades", 0)}
     - Win Rate: {perf.get("win_rate", 0)*100:.1f}%
-    - Profit Factor: {perf.get("profit_factor", 0):.2f}
-    - Total PnL: {perf.get("total_pnl", 0):+,.0f} KRW
-    
-    ## Current Configuration
+
+    ## ★ Signal Filter Stats (Why coins are REJECTED)
+    ### HOLD Reasons (Blocked by Signal Config):
+    {hold_stats_str}
+
+    ### Gatekeeper Rejects:
+    {gate_stats_str}
+
+    ## CRITICAL INSTRUCTIONS:
+    1. If 'price_too_high' count is high (>300): INCREASE signal.price_pos_max (up to 0.90).
+    2. If 'low_volume' count is high (>200): DECREASE signal.volume_confirm_mult (down to 0.5).
+    3. If 'downtrend' count is high: Consider setting strategy.use_trend_filter=false.
+    4. If 'no_signal_streak' is extremely high, aggressively relax ALL filters.
+
+    ## Current Config
     {current_json}
-    
-    ## Strategy Adjustments based on Market Context:
-    - If 'Sideways/Choppy' or 'Downtrend': You MUST lower `take_profit_pct` (e.g., 0.005~0.015), tighten `trailing_stop_profit_threshold`, and reduce `risk_per_trade`. Set `atr_mult_stop` to be tighter.
-    - If 'Uptrend': Expand `take_profit_pct` (e.g., 0.02~0.05) to ride the trend.
-    - If 'Win Rate < 40%': Strengthen RSI filters (lower rsi_max, tighten price_pos block).
-    
-    ## Parameter Limits
-    take_profit_pct: 0.005~0.080 | max_loss_per_trade: 0.008~0.040
-    trailing_stop_profit_threshold: 0.005~0.030
-    rsi_min: 15~40 | rsi_max: 50~75 | rsi_oversold: 20~40
-    
-    Respond ONLY in the exact JSON format below. Do NOT use markdown formatting (no ```json).
+
+    Respond ONLY in JSON format:
     {{
-      "params": {{ ... }},
-      "strategy": {{ ... }},
-      "signal": {{ ... }},
-      "risk": {{ ... }},
-      "changes_summary": "English summary of adjustments focusing on market adaptation"
+    "params": {{ ... }},
+    "strategy": {{ ... }},
+    "signal": {{ ... }},
+    "risk": {{ ... }},
+    "changes_summary": "English summary of what you changed and WHY"
     }}
     """
     
@@ -1463,20 +1414,23 @@ def ai_refresh_all_configs(ai_cfg: AIConfig, perf: dict) -> tuple:
             },
             timeout=180
         )
-        response_text = resp.json().get("response", "{}")
-        
-        parsed = json.loads(response_text)
+        raw_resp = resp.json()       
+        if "error" in raw_resp:
+            logger.error(f"[AI Strategist] Ollama 오류: {raw_resp['error']}")
+            return ai_cfg, f"(Ollama error: {raw_resp['error']})"
+        parsed = json.loads(raw_resp.get("response", "{}"))         # ✅ raw_resp 사용
         summary = parsed.pop("changes_summary", "(No changes)")
         
         new_cfg = AIConfig.from_dict(parsed)
-        new_cfg = validate_and_clamp_config(new_cfg)
+        new_cfg = validate_and_clamp_config(new_cfg) # 여기서 clamp됨
         new_cfg.save_to_db()
         save_ai_change_summary(summary)
         
-        logger.info(f"[AI Strategist] Config updated based on context: {summary[:100]}")
+        logger.info(f"[AI Strategist] Updated: {summary[:100]}")
         return new_cfg, summary
+
     except Exception as e:
-        logger.error(f"[AI Strategist] Update error: {e}")
+        logger.error(f"[AI Strategist] Error: {e}")
         return ai_cfg, f"(Error: {e})"
 
 # ============================================================
@@ -1501,26 +1455,33 @@ def ai_verify_buy_signal(market: str, current_price: float, df: pd.DataFrame, si
             chart_text += f"- Close: {row['close']:,.0f} | Change: {change:+.2f}% | VolRatio: {vol_ratio:.1f}x | RSI: {row['rsi']:.1f}\n"
 
         prompt = f"""
-        You are a highly conservative Risk Manager for a crypto fund.
-        The trading algorithm just triggered a BUY signal for {market} based on the strategy: '{signal_reason}'.
-        Current Price is {current_price:,.0f}.
-        
-        Analyze the recent 15 candle sequence below to prevent buying into a trap (whipsaw/fakeout).
-        
+        You are a momentum trading signal validator for a short-term scalping bot on Bithumb.
+        The bot targets +1~1.5% profit per trade within 1-2 hours.
+        A BUY signal was triggered for {market} (strategy: '{signal_reason}').
+        Current Price: {current_price:,.0f} KRW
+
+        Analyze the last 15 candles to confirm if this is a GENUINE momentum entry or a FAKEOUT.
+
         Recent Price Action:
         {chart_text}
-        
-        Rules:
-        1. If the price is continuously dropping with red candles and weak volume, REJECT.
-        2. If this looks like a dead-cat bounce (brief green candle after massive drop without volume), REJECT.
-        3. If there is a solid support, oversold RSI stabilization, or strong volume breakout, APPROVE.
-        
-        Respond ONLY with a valid raw JSON object. Do NOT use markdown code blocks (```json).
-        Do NOT add any greetings or explanations outside the JSON.
-        {
-        "decision": "APPROVE" or "REJECT",
-        "reason": "1 short sentence explaining the risk assessment"
-        }
+
+        APPROVE if ANY of these are true:
+        1. Price is stabilizing or bouncing from a recent low with increasing volume
+        2. RSI was oversold (<40) and is now recovering upward
+        3. Strong bullish candle with above-average volume confirms breakout
+
+        REJECT if ALL of these are true:
+        1. Price is in continuous decline (3+ consecutive red candles)
+        2. Volume is weak or decreasing
+        3. No clear support level visible
+
+        Default to APPROVE for ambiguous cases — false negatives (missing trades) are more costly than false positives.
+
+        Respond ONLY with raw JSON (no markdown):
+        {{
+            "decision": "APPROVE",
+            "reason": "One short sentence explaining your decision"
+        }}
         """
 
         resp = requests.post(CFG.ollama_url, json={
@@ -1535,13 +1496,21 @@ def ai_verify_buy_signal(market: str, current_price: float, df: pd.DataFrame, si
             }
         }, timeout=10)
         
-        response_text = resp.json().get("response", "{}")
-        
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        raw_resp = resp.json()
+        if "error" in raw_resp:
+            logger.error(f"[AI Gatekeeper] Ollama 오류: {raw_resp['error']}")
+            return {"decision": "REJECT", "reason": f"Ollama error: {raw_resp['error']}"}
+        response_text = raw_resp.get("response", "")
+        logger.info(f"[AI Gatekeeper] Raw: {response_text[:300]}")
+        if not response_text.strip():
+            logger.error("[AI Gatekeeper] 응답 비어있음 — OLLAMA_URL 또는 OLLAMA_MODEL_FAST 확인 필요")
+            return {"decision": "REJECT", "reason": "Empty response from Ollama"}
+        json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
         if json_match:
             parsed = json.loads(json_match.group(0))
         else:
-            parsed = json.loads(response_text) # Fallback
+            logger.error(f"[AI Gatekeeper] JSON 파싱 실패: {response_text[:300]}")
+            return {"decision": "REJECT", "reason": "JSON parse failed"}
             
         decision = parsed.get("decision", "REJECT").upper()
         reason = parsed.get("reason", "Failed to parse reason")
@@ -1559,6 +1528,31 @@ def ai_verify_buy_signal(market: str, current_price: float, df: pd.DataFrame, si
         # 에러 발생 시 안전하게 매수 거부
         return {"decision": "REJECT", "reason": f"Gatekeeper Error: {e}"}
 
+def calculate_adaptive_sleep(no_signal_streak: int, risk_cfg: RiskConfig) -> int:
+    """신호 없음 연속 횟수에 따른 적응형 슬립 시간"""
+    if no_signal_streak <= 2:
+        return 60         # 1분
+    elif no_signal_streak <= 5:
+        return 120        # 2분
+    else:
+        return min(risk_cfg.max_sleep_sec, 300)
+
+def maybe_auto_relax_filters(ai_cfg: AIConfig, no_signal_streak: int) -> AIConfig:
+    if no_signal_streak < 4:
+        return ai_cfg
+
+    sg = ai_cfg.signal
+    factor = min(1.0, (no_signal_streak - 3) * 0.05)
+
+    new_ppm = min(0.95, sg.price_pos_max + factor * 0.2)
+    if new_ppm > sg.price_pos_max:
+        logger.info(f"[AutoRelax] price_pos_max: {sg.price_pos_max:.2f} -> {new_ppm:.2f}")
+        sg.price_pos_max = new_ppm
+
+    sg.volume_confirm_mult = max(0.4, sg.volume_confirm_mult - factor * 0.3)
+
+    ai_cfg.save_to_db()
+    return ai_cfg
 
 # ============================================================
 # 메인 루프
@@ -1660,22 +1654,26 @@ def run():
             ai_pos_count = sum(1 for _, p in positions.iterrows()
                              if not is_excluded_coin(p["market"]))
             
+            signals = []
+                
             if ai_pos_count >= params.max_positions:
                 logger.info(f"[INFO] Max positions reached: {ai_pos_count}/{params.max_positions}")
             else:
-                signals = []
                 for market in markets:
                     if is_excluded_coin(market):
                         continue
                     if not positions.empty and market in positions["market"].values:
                         continue
-                    
+
                     sig = generate_swing_signals(market, params, strategy, sig_cfg)
                     if sig["signal"] == "buy":
                         signals.append((market, sig))
-                
+                    else:
+                        # ✅ HOLD 사유 집계
+                        HOLD_REASON_COUNTS[sig.get("reason", "unknown")] += 1
+
                 if not signals:
-                    logger.info("[INFO] No buy signals")
+                    pass  # 아래 streak 블록에서 통합 처리
                 else:
                     logger.info(f"[SIGNAL] {len(signals)} buy signals found")
                     avail_krw = get_available_krw_balance()
@@ -1713,49 +1711,39 @@ def run():
                         # =========================================================
                         # [추가됨] 3단계 검문관(Gatekeeper) 호출 로직
                         # =========================================================
-                        entry_price = signal["price"]
+                        entry_price  = float(signal["price"])
                         signal_reason = signal.get("reason", "unknown")
-                        
-                        # 매수 대상 코인의 30분봉 데이터 불러오기 (검문용)
-                        df_verify = db_get_candles(market, "30m", limit=300)
-                        
-                        if not df_verify.empty:
-                            # 보조 지표 계산 (프롬프트에 넘겨줄 데이터)
+                        confidence   = float(signal.get("confidence", 0.0))
+
+                        if confidence >= risk_cfg.auto_pass_confidence:
+                            logger.info(f"[GATE] {market} conf={confidence:.2f} >= {risk_cfg.auto_pass_confidence} → AUTO PASS")
+
+                        elif confidence >= risk_cfg.min_gate_confidence:
+                            df_verify = db_get_candles(market, "15m", limit=300)
+                            if df_verify is None or df_verify.empty:
+                                logger.info(f"[GATE] {market} verify 데이터 없음 → SKIP")
+                                continue
+
                             df_verify["volume_ma"] = df_verify["volume"].rolling(20).mean()
                             delta = df_verify["close"].diff()
-                            # Wilder의 EMA 방식
                             gain = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean()
                             loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14).mean()
                             df_verify["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
-                            
-                            # 3단계 검문관 승인/거절 판별
-                            gate_result = ai_verify_buy_signal(market, signal["price"], df_verify, signal.get("reason", "unknown"))
-                            if gate_result == "reject":
-                                logger.info(f"[GATE] {market} AI 검문 거부 → 매수 취소")
-                                continue
-                            
-                            if gate_result.get("decision") != "APPROVE":
-                                logger.info(f"[GATEKEEPER REJECT] {market} 매수 취소 사유: {gate_result.get('reason')}")
-                                continue  # 검문 실패 시 아래 매수 코드를 건너뛰고 다음 코인으로 넘어감
-                            else:
-                                logger.info(f"[GATEKEEPER APPROVE] {market} 매수 승인: {gate_result.get('reason')}")
-                        else:
-                            # 캔들 데이터 없을 때 신호 confidence 기준으로 자동 판단
-                            confidence = signal.get("confidence", 0.0)
-                            AUTO_APPROVE_THRESHOLD = 0.90   # 높은 확신도일 때만 통과
 
-                            if confidence >= AUTO_APPROVE_THRESHOLD:
-                                logger.warning(
-                                    f"[GATE] {market} 캔들 없음 → confidence={confidence:.2f} "
-                                    f">= {AUTO_APPROVE_THRESHOLD} → Gatekeeper 자동 승인"
-                                )
-                                # 통과 → 아래 매수 로직으로 진행
-                            else:
-                                logger.warning(
-                                    f"[GATE] {market} 캔들 없음 → confidence={confidence:.2f} "
-                                    f"< {AUTO_APPROVE_THRESHOLD} → 매수 취소"
-                                )
+                            gate_result = ai_verify_buy_signal(market, entry_price, df_verify, signal_reason)
+                            decision = (gate_result or {}).get("decision", "REJECT").upper()
+                            reason   = (gate_result or {}).get("reason", "no_reason")
+
+                            if decision != "APPROVE":
+                                GATE_REJECT_REASON_COUNTS[reason] += 1
+                                logger.info(f"[GATEKEEPER REJECT] {market} conf={confidence:.2f} | {reason}")
                                 continue
+                            else:
+                                logger.info(f"[GATEKEEPER APPROVE] {market} conf={confidence:.2f} | {reason}")
+
+                        else:
+                            logger.info(f"[GATE] {market} conf={confidence:.2f} < {risk_cfg.min_gate_confidence} → SKIP")
+                            continue
                         
                         total_cap = avail_krw
                         
@@ -1782,15 +1770,30 @@ def run():
                     
                     db_set_meta("last_entries", json.dumps(last_entries))
             
-            logger.info(f"\n[SLEEP] Waiting {CFG.collect_interval_sec} seconds...\n")
-            time.sleep(CFG.collect_interval_sec)
+            global NO_SIGNAL_STREAK
+            if not signals:
+                NO_SIGNAL_STREAK += 1
+                logger.info("[INFO] No buy signals")
+                logger.info(f"[STATS] HOLD top5: {HOLD_REASON_COUNTS.most_common(5)}")
+                logger.info(f"[STATS] GATE reject top5: {GATE_REJECT_REASON_COUNTS.most_common(5)}")
+                AI_CFG = maybe_auto_relax_filters(AI_CFG, NO_SIGNAL_STREAK)
+                sleep_sec = calculate_adaptive_sleep(NO_SIGNAL_STREAK, risk_cfg)
+                logger.info(f"\n[SLEEP] Waiting {sleep_sec}s (no_signal_streak={NO_SIGNAL_STREAK})\n")
+                time.sleep(sleep_sec)
+                continue
+            else:
+                NO_SIGNAL_STREAK = 0
+                sleep_sec = 60
+                logger.info(f"\n[SLEEP] Signal processed. Waiting {sleep_sec}s\n")
+                time.sleep(sleep_sec)
+                continue
         
         except KeyboardInterrupt:
             logger.info("\n[SHUTDOWN] Bot stopped")
             break
         except Exception as e:
-            logger.error(f"[ERROR] Main loop exception: {e}", exc_info=True)
-            time.sleep(30)
+            logger.error(f"\n[ERROR] 메인 루프 예외: {e}", exc_info=True)  # ✅ 스택 트레이스 포함
+            time.sleep(60)
 
 if __name__ == "__main__":
     run()
