@@ -1,438 +1,330 @@
-# ============================================================
-# claude_main.py — AI 전략 완전 제어 리팩토링 버전
-# ============================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Bithumb Spot Trading Bot (single-file, refactored)
 
-import time, json, sqlite3, math
+Goal of this rewrite:
+- Make the bot *actually trade* instead of getting stuck in HOLD loops.
+- Turn previously "hard rejects" (stop_too_tight / no_pattern_match / ML filter) into *soft scoring* where possible.
+- Replace unrealistic liquidity thresholds with a universe-selection + small, sane hard checks.
+- Keep safety: position sizing by stop distance, global kill switch, per-coin cooldown.
+
+Notes from your logs (2026-03-05):
+- HOLD reasons dominated by: stop_too_tight, low_volume, no_pattern_match
+- GATE rejects dominated by: ML_filter_pullback_ema20 and hard_block low_volume / low_trade_value
+So we address those explicitly.
+Run:
+    python main.py --dry-run
+    python main.py --live
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+import dataclasses
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
-from typing import List
-import requests
-import pandas as pd
-import numpy as np
-import os, hmac, hashlib, base64, urllib.parse, jwt
-from dotenv import load_dotenv
-import re, logging, smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
-import threading, sys
+import difflib
+import hashlib
+import json
+import logging
+import math
+import os
+import random
+import sqlite3
+import sys
+import threading
+import time
+import uuid
+import urllib.parse
 from collections import Counter
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+import jwt
+from dotenv import load_dotenv
+try:
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = None  # type: ignore[assignment]
 
 load_dotenv()
 
 # ============================================================
-# 로깅 설정
+# Logging
 # ============================================================
-current_log_file = None
-file_handler = None
-logger = logging.getLogger("TradingBot")
-logger.setLevel(logging.DEBUG)
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+
+LOG = logging.getLogger("TradingBot")
+LOG.setLevel(logging.DEBUG)
+
+_FMT = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+_console = logging.StreamHandler(sys.stdout)
+_console.setLevel(logging.INFO)
+_console.setFormatter(_FMT)
+LOG.addHandler(_console)
+
+_current_log_file: Optional[str] = None
+_file_handler: Optional[logging.FileHandler] = None
+_EMAIL_SEND_LOCK = threading.Lock()
 
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
 TARGET_EMAIL = os.getenv("TARGET_EMAIL")
-EMAIL_INTERVAL = 3 * 60 * 60
+EMAIL_INTERVAL_SEC = int(os.getenv("EMAIL_INTERVAL_SEC", str(3 * 60 * 60)))
+PAPER_INITIAL_KRW = float(os.getenv("PAPER_INITIAL_KRW") or os.getenv("INITIAL_KRW") or "200000")
+INITIAL_CAPITAL_KRW = float(os.getenv("INITIAL_CAPITAL_KRW") or os.getenv("PAPER_INITIAL_KRW") or os.getenv("INITIAL_KRW") or "200000")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+OLLAMA_MODEL_FAST = os.getenv("OLLAMA_MODEL_FAST", OLLAMA_MODEL)
+OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "20"))
+OLLAMA_EMAIL_SUMMARY = os.getenv("OLLAMA_EMAIL_SUMMARY", "1").strip().lower() in {"1", "true", "yes", "on"}
 
-def get_new_log_filename():
-    """현재 시간 기준으로 새 로그 파일명 생성"""
+DEFAULT_EXCLUDED_SYMBOLS = {"BTC", "ETH"}
+
+def normalize_symbol(value: Any) -> str:
+    s = str(value or "").strip().upper()
+    if not s:
+        return ""
+    if "-" in s:
+        s = s.split("-")[-1]
+    return s
+
+def normalize_excluded_symbols(values: Optional[Iterable[Any]] = None) -> set:
+    out = set(DEFAULT_EXCLUDED_SYMBOLS)
+    if values:
+        for v in values:
+            sym = normalize_symbol(v)
+            if sym:
+                out.add(sym)
+    return out
+
+def market_is_excluded(market: Any, excluded_symbols: Optional[Iterable[Any]] = None) -> bool:
+    return normalize_symbol(market) in normalize_excluded_symbols(excluded_symbols)
+
+
+def _new_log_filename() -> str:
     return datetime.now().strftime("%Y_%m_%d_%H_%M.log")
 
-def setup_logger():
-    """새로운 로그 파일을 생성하고 핸들러를 교체함"""
-    global current_log_file, file_handler, logger
-    new_log_file = get_new_log_filename()
-    if file_handler:
-        logger.removeHandler(file_handler)
-        file_handler.close()
-    current_log_file = new_log_file
-    file_handler = logging.FileHandler(current_log_file, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    logger.info(f"새로운 로그 파일 생성됨: {current_log_file}")
-    return new_log_file
-
-def send_email_and_rotate_log():
-    """현재 로그 파일을 전송하고, 새로운 로그 파일로 교체"""
-    global current_log_file, last_portfolio_value, last_email_time
-    file_to_send = current_log_file
-    if not file_to_send or not os.path.exists(file_to_send):
-        logger.warning("전송할 로그 파일이 없습니다.")
-        return
-    
-    current_portfolio = get_total_portfolio_value()
-    current_value = current_portfolio['total_krw']
-    
-    if last_portfolio_value is None:
-        last_portfolio_value = current_value
-    diff_krw = current_value - last_portfolio_value
-    diff_pct = (diff_krw / last_portfolio_value * 100) if last_portfolio_value > 0 else 0
-    
-    perf = analyze_trading_performance()
-    change_raw = db_get_meta("last_ai_config_change", None)
-    change_text = "(기록 없음)"
-    change_ts = None
-    if change_raw:
+def setup_logger_file() -> str:
+    global _current_log_file, _file_handler
+    newf = _new_log_filename()
+    if _file_handler:
         try:
-            obj = json.loads(change_raw)
-            change_text = obj.get("text", "(변경 없음)")
-            change_ts = obj.get("ts", None)
+            LOG.removeHandler(_file_handler)
         except Exception:
-            change_text = change_raw
-    
-    coins_lines = []
-    coins = current_portfolio.get("coins", {})
-    if coins:
-        for coin, info in sorted(coins.items(), key=lambda x: x[1]['value_krw'], reverse=True):
-            coins_lines.append(f" - {coin}: {info['balance']:.6f}개, 평가 {info['value_krw']:,.0f}원 (@ {info['price']:,.0f})")
-    else:
-        coins_lines.append(" - (보유 코인 없음)")
-    
-    now = datetime.now()
-    subject = f"Trading Bot : {now.strftime('%Y/%m/%d %H:%M')} (3시간 리포트)"
-    change_time_str = ""
-    if change_ts:
-        change_time_str = datetime.fromtimestamp(change_ts).strftime("%Y/%m/%d %H:%M")
-    
-    body = f"""
-=== 트레이딩 봇 3시간 리포트 ===
+            pass
+        try:
+            _file_handler.close()
+        except Exception:
+            pass
+    _current_log_file = newf
+    _file_handler = logging.FileHandler(newf, encoding="utf-8")
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(_FMT)
+    LOG.addHandler(_file_handler)
+    LOG.info(f"새 로그 파일 생성: {newf}")
+    return newf
 
-1) 3시간 전 대비 금액 증감
- - 현재 총 자산: {current_value:,.0f}원
- - 3시간 전(직전 리포트): {last_portfolio_value:,.0f}원
- - 증감: {diff_krw:+,.0f}원 ({diff_pct:+.2f}%)
+setup_logger_file()
 
-2) AI Config 변동 내역
- - 마지막 변경 시각: {change_time_str if change_time_str else "(알 수 없음)"}
-{change_text}
+# ============================================================
+# Email (optional)
+# ============================================================
 
-3) 승률 / 최근 100거래 성과
- - 총 거래 수: {perf['total_trades']}
- - 승률: {perf['win_rate']*100:.1f}%
- - 총 손익: {perf['total_pnl']:+,.0f}원
- - 평균 이익: {perf['avg_profit']:+,.0f}원
- - 평균 손실: {-perf['avg_loss']:,.0f}원
- - 총 수수료: {perf['total_fees']:,.0f}원
+def _send_email_with_attachment(subject: str, body: str, file_to_send: str):
+    if not (GMAIL_USER and GMAIL_PASSWORD and TARGET_EMAIL):
+        LOG.debug("이메일 환경변수가 없어 전송을 건너뜁니다.")
+        return
 
-4) 포트폴리오 구성 (보유코인 포함)
- - KRW 잔고: {current_portfolio['krw']:,.0f}원
- - 코인 평가액: {current_portfolio['total_coin_value']:,.0f}원
- - 보유 코인 수: {len(coins)}
-{chr(10).join(coins_lines)}
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email import encoders
 
-(상세 로그는 첨부 파일 참고)
-"""
-    
+    msg = MIMEMultipart()
+    msg["From"] = GMAIL_USER
+    msg["To"] = TARGET_EMAIL
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    with open(file_to_send, "rb") as f:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(file_to_send)}")
+        msg.attach(part)
+
+    server = smtplib.SMTP("smtp.gmail.com", 587)
     try:
-        if GMAIL_USER and GMAIL_PASSWORD:
-            msg = MIMEMultipart()
-            msg['From'] = GMAIL_USER
-            msg['To'] = TARGET_EMAIL
-            msg['Subject'] = subject
-            msg.attach(MIMEText(body, 'plain'))
-            with open(file_to_send, 'rb') as f:
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header('Content-Disposition', f'attachment; filename={file_to_send}')
-                msg.attach(part)
-            server = smtplib.SMTP('smtp.gmail.com', 587)
-            try:
-                server.starttls()
-                server.login(GMAIL_USER, GMAIL_PASSWORD)
-                server.send_message(msg)
-            finally:
-                server.quit()
-            logger.info(f"이메일 전송 성공: {file_to_send} -> {TARGET_EMAIL}")
-            last_portfolio_value = current_value
-            last_email_time = time.time()
-        else:
-            logger.warning("이메일 설정이 없어 전송을 건너뜁니다.")
-    except Exception as e:
-        logger.error(f"이메일 전송 중 오류 발생: {e}")
-    setup_logger()
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_PASSWORD)
+        server.send_message(msg)
+    finally:
+        server.quit()
 
-def log_rotation_scheduler():
-    """30분마다 로그 파일을 전송하고 교체하는 스케줄러"""
+def send_log_report_once(get_report_fn, *, rotate_log: bool = False, subject_suffix: str = "") -> bool:
+    if not (GMAIL_USER and GMAIL_PASSWORD and TARGET_EMAIL):
+        return False
+    with _EMAIL_SEND_LOCK:
+        if not _current_log_file or not os.path.exists(_current_log_file):
+            LOG.debug("[EMAIL] 전송할 로그 파일이 없습니다.")
+            return False
+        subject, body = get_report_fn()
+        if subject_suffix:
+            subject = f"{subject} | {subject_suffix}"
+        _send_email_with_attachment(subject, body, _current_log_file)
+        if rotate_log:
+            setup_logger_file()
+        return True
+
+def email_log_rotation_scheduler(get_report_fn):
+    """
+    Every EMAIL_INTERVAL_SEC:
+      - email the current log
+      - rotate to a new log file
+    """
     while True:
-        time.sleep(EMAIL_INTERVAL)
-        send_email_and_rotate_log()
-
-setup_logger()
-last_portfolio_value = None
-last_email_time = 0
+        time.sleep(EMAIL_INTERVAL_SEC)
+        try:
+            send_log_report_once(get_report_fn, rotate_log=True, subject_suffix="scheduled")
+        except Exception as e:
+            LOG.error(f"[EMAIL] 전송/로테이션 실패: {e}")
 
 # ============================================================
-# 설정 데이터클래스
+# Config + DB persistence (fixes AIConfig.load_from_db issue)
 # ============================================================
 
 @dataclass
-class Params:
-    """거래 전략 기본 파라미터"""
-    max_positions: int = 20              
-    max_coin_weight: float = 0.5       
-    risk_per_trade: float = 0.02        
-    position_allocation_pct: float = 0.9
-    atr_mult_stop: float = 2.0          
-    breakout_lookback: int = 2
-    trend_ma_fast: int = 20            
-    trend_ma_slow: int = 60 
-    cooldown_minutes: int = 30
-    min_volume_mult: float = 0.8
+class BotParams:
+    # portfolio / sizing
+    max_positions: int = 5
+    max_coin_weight: float = 0.35         # per-position max allocation (fraction of equity)
+    max_total_allocation: float = 0.95    # total allocation cap
+    risk_per_trade: float = 0.01          # 1% of equity risked per trade (by stop distance)
+    min_order_krw: int = 5000             # Bithumb KRW min order; see Bithumb notice (2024-02-19)
+    fee_rate: float = 0.0004              # estimate, adjust to your tier
 
-@dataclass
-class StrategyConfig:
-    """전략 종료 조건 파라미터"""
-    use_trend_filter: bool = False
-    use_volume_filter: bool = True
-    use_volatility_filter: bool = False
-    min_volume_mult: float = 0.8
-    volatility_mult: float = 0.8
-    trailing_stop_profit_threshold: float = 0.015
-    max_loss_per_trade: float = 0.02
+    # stop / take-profit
+    atr_period: int = 14
+    atr_mult_stop: float = 2.2
+    min_stop_pct: float = 0.004           # 0.4% minimum stop distance
+    max_stop_pct: float = 0.10            # skip if stop would be too wide
+    max_stop_pct_relaxed: float = 0.14    # relaxed mode widens stop cap instead of rejecting volatile leaders
     take_profit_pct: float = 0.02
-    time_stop_hours: float = 4.0
+    trailing_start_pct: float = 0.012
+    trailing_atr_mult: float = 1.8
+    time_stop_hours: float = 6.0
+
+    # cycle
+    cycle_seconds: int = 300
+    candle_timeframe: str = "15m"         # Bithumb public candlestick supports 15m
+
+    # universe selection
+    universe_size: int = 25               # top N by 24h trade value
+    exclude: List[str] = field(default_factory=lambda: ["BTC", "ETH"])  # always exclude manual assets from bot universe/reporting
+    manage_unmanaged_live_holdings: bool = True  # adopt non-excluded live holdings into bot management
+    adopt_holdings_min_value_krw: int = 5000       # ignore dust below practical sell threshold
+    adopt_take_profit_immediate: bool = True       # if adopted holding already exceeds TP, sell immediately
 
 @dataclass
-class SignalConfig:
-    """신호 생성 파라미터"""
-    # RSI
-    rsi_min: float = 20.0
-    rsi_max: float = 85.0
-    rsi_oversold: float = 35.0
-    rsi_overbought: float = 72.0
-    # 가격 포지션
-    price_pos_min: float = 0.10
-    price_pos_max: float = 0.80
-    price_pos_block: float = 0.92
-    price_pos_lookback: int = 20
-    # 추세
-    trend_strong_pct: float = 0.015
-    # 거래량
-    volume_confirm_mult: float = 0.55
-    volume_strong_mult: float = 1.3
-    # BB
-    bb_lower_touch_pct: float = 0.03
-    # 캔들 강도
-    candle_strength_mult: float = 0.4
-    big_candle_mult: float = 0.8
-    # ATR 손절 배수
-    atr_stop_p1: float = 1.5
-    atr_stop_p2: float = 1.2
-    atr_stop_p3: float = 0.4
-    atr_stop_p4: float = 1.0
-    atr_stop_p5: float = 1.0
-    # 손절 안전 마진
-    stop_margin_p1: float = 0.98
-    stop_margin_p2: float = 0.97
-    stop_margin_p3: float = 0.97
-    stop_margin_p4: float = 0.96
-    stop_margin_p5: float = 0.96
-    # 패턴 활성화
-    use_pattern_1: bool = True
-    use_pattern_2: bool = True
-    use_pattern_3: bool = True
-    use_pattern_4: bool = True
-    use_pattern_5: bool = True
-    use_pattern_6: bool = True
-    # 패턴 우선순위
-    pattern_priority: List[int] = field(default_factory=lambda: [3, 1, 2, 4, 5, 6])
+class FilterParams:
+    # liquidity / sanity checks
+    min_trade_value_ma_krw: float = 1_200_000.0  # avg trade value per 15m candle
+    min_vol_ratio_hard: float = 0.06             # only reject truly dead candles
+    min_vol_ratio_soft: float = 0.50             # soft target; affects score
+
+    # gating
+    min_signal_score: float = 0.58               # base min score to enter
+    min_signal_score_relaxed: float = 0.52       # when stagnation breaker triggers
+    stagnation_streak_to_relax: int = 20         # cycles without fills -> relax
+    defensive_loss_trigger: int = 7              # losses in last 10 trades -> defensive mode
 
 @dataclass
-class RiskConfig:
-    """리스크/주문 실행 파라미터"""
-    # 트레일링
-    trail_atr_mult: float = 2.0
-    pullback_exit_pct: float = 0.02
-    pullback_lookback: int = 10
-    # 쿨다운
-    cooldown_after_loss: int = 30
-    cooldown_after_win: int = 5
-    cooldown_default: int = 5
-    # 포지션 사이징
-    invest_capital_pct: float = 0.85
-    risk_multiplier: float = 4.0
-    # 주문 실행
-    order_wait_sec: int = 90
-    market_order_buffer: float = 1.1
-    available_krw_safety: float = 0.95
-    min_order_mult: float = 1.0
-    # Gatekeeper / 슬립 제어
-    auto_pass_confidence: float = 0.9
-    min_gate_confidence: float = 0.55
-    max_sleep_sec: int = 300
-
-@dataclass
-class Config:
-    """시스템 설정"""
-    db_path: str = os.getenv("DB_PATH", "trading_bot.db")
-    ollama_url: str = os.getenv("OLLAMA_URL")
-    ollama_model: str = os.getenv("OLLAMA_MODEL")
-    ollama_model_fast: str = os.getenv("OLLAMA_MODEL_FAST", os.getenv("OLLAMA_MODEL")) 
-    quote: str = "KRW"
-    exclude: tuple = ("BTC", "ETH")
-    universe_size: int = 80
-    collect_interval_sec: int = 60
-    ai_market_refresh_min = 30
-    ai_strategy_refresh_min = 60
-    fee_rate: float = 0.0004
-    min_order_krw: float = 7000
+class MLParams:
+    enabled: bool = True
+    hard_reject_below: float = 0.12      # never trade if predicted win prob < this
+    soft_floor: float = 0.35             # below this, apply penalty but not hard reject
+    min_trades_to_train: int = 50
+    min_validation_accuracy_for_hard_reject: float = 0.64
+    min_samples_for_hard_reject: int = 600
 
 @dataclass
 class AIConfig:
-    """AI가 제어하는 모든 설정의 통합 컨테이너"""
-    params: Params = field(default_factory=Params)
-    strategy: StrategyConfig = field(default_factory=StrategyConfig)
-    signal: SignalConfig = field(default_factory=SignalConfig)
-    risk: RiskConfig = field(default_factory=RiskConfig)
-    
+    params: BotParams = field(default_factory=BotParams)
+    filters: FilterParams = field(default_factory=FilterParams)
+    ml: MLParams = field(default_factory=MLParams)
+
     def to_dict(self) -> dict:
-        return {
-            "params": asdict(self.params),
-            "strategy": asdict(self.strategy),
-            "signal": asdict(self.signal),
-            "risk": asdict(self.risk),
-        }
-    
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
-    
+        return asdict(self)
+
     @classmethod
-    def from_dict(cls, data: dict) -> "AIConfig":
-        cfg = cls()
-        def safe_set(obj, kv: dict):
-            for k, v in kv.items():
-                if hasattr(obj, k):
-                    try: 
-                        setattr(obj, k, v)
-                    except: 
-                        pass
-        if "params" in data: safe_set(cfg.params, data["params"])
-        if "strategy" in data: safe_set(cfg.strategy, data["strategy"])
-        if "signal" in data: safe_set(cfg.signal, data["signal"])
-        if "risk" in data: safe_set(cfg.risk, data["risk"])
-        return cfg
-    
+    def from_dict(cls, d: dict) -> "AIConfig":
+        d = d or {}
+        return cls(
+            params=BotParams(**(d.get("params") or {})),
+            filters=FilterParams(**(d.get("filters") or {})),
+            ml=MLParams(**(d.get("ml") or {})),
+        )
+
     @classmethod
-    def from_json(cls, json_str: str) -> "AIConfig":
-        return cls.from_dict(json.loads(json_str))
-    
-    def save_to_db(self):
-        db_set_meta("ai_config_v2", self.to_json())
-        logger.info("[AIConfig] 설정 DB 저장 완료")
-    
-    @classmethod
-    def load_from_db(cls) -> "AIConfig":
-        raw = db_get_meta("ai_config_v2")
-        if raw:
-            try:
-                cfg = cls.from_json(raw)
-                logger.info("[AIConfig] 설정 DB 로드 완료")
-                return cfg
-            except Exception as e:
-                logger.warning(f"[AIConfig] 로드 실패, 기본값 사용: {e}")
-        return cls()
+    def load_from_db(cls, db_path: str, key: str = "ai_config") -> "AIConfig":
+        """Fix: the original crash came from missing load_from_db; this implementation is robust."""
+        try:
+            con = sqlite3.connect(db_path)
+            cur = con.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+            con.commit()
+            cur.execute("SELECT v FROM meta WHERE k=?", (key,))
+            row = cur.fetchone()
+            con.close()
+            if not row or not row[0]:
+                return cls()
+            return cls.from_dict(json.loads(row[0]))
+        except Exception as e:
+            LOG.warning(f"[CFG] DB 로드 실패 → 기본값 사용: {e}")
+            return cls()
 
-CFG = Config()
-AI_CFG = AIConfig()
-
-NO_SIGNAL_STREAK     = 0
-HOLD_REASON_COUNTS   = Counter()
-GATE_REJECT_REASON_COUNTS = Counter()
-
-# ============================================================
-# AI Config 범위 검증 함수
-# ============================================================
-
-def validate_and_clamp_config(cfg: AIConfig) -> AIConfig:
-    """AI가 설정한 값의 범위 검증 및 자동 보정"""
-    p = cfg.params
-    s = cfg.strategy
-    sg = cfg.signal
-    r = cfg.risk
-    
-    # ── Params ──
-    p.risk_per_trade = max(0.010, min(0.080, p.risk_per_trade))
-    p.max_positions = max(1, min(20, int(p.max_positions)))
-    p.trend_ma_fast = max(5, min(30, int(p.trend_ma_fast)))
-    p.trend_ma_slow = max(30, min(120, int(p.trend_ma_slow)))
-    if p.trend_ma_fast >= p.trend_ma_slow:
-        p.trend_ma_slow = p.trend_ma_fast + 20
-    p.cooldown_minutes = max(15, min(240, int(p.cooldown_minutes)))
-    p.atr_mult_stop = max(1.0, min(5.0, p.atr_mult_stop))
-    
-    # ── StrategyConfig ──
-    s.max_loss_per_trade = max(0.008, min(0.050, s.max_loss_per_trade))
-    s.take_profit_pct = max(0.010, min(0.100, s.take_profit_pct))
-    if s.take_profit_pct <= s.max_loss_per_trade:
-        s.take_profit_pct = s.max_loss_per_trade * 1.6
-    s.time_stop_hours = max(2.0, min(12.0, s.time_stop_hours))
-    s.trailing_stop_profit_threshold = max(0.008, min(0.050, s.trailing_stop_profit_threshold))
-    s.min_volume_mult = max(0.5, min(3.0, s.min_volume_mult))
-    
-    # ── SignalConfig ──
-    sg.rsi_min = max(15.0, min(45.0, sg.rsi_min))
-    sg.rsi_max = max(50.0, min(90.0, sg.rsi_max))
-    sg.rsi_oversold = max(20.0, min(45.0, sg.rsi_oversold))
-    sg.rsi_overbought = max(60.0, min(85.0, sg.rsi_overbought))
-    if sg.rsi_min >= sg.rsi_max: 
-        sg.rsi_max = sg.rsi_min + 20
-    sg.price_pos_min = max(0.05, min(0.40, sg.price_pos_min))
-    sg.price_pos_max = max(sg.price_pos_min + 0.10, min(0.95, sg.price_pos_max))
-    sg.price_pos_block = max(0.70, min(0.99, sg.price_pos_block))
-    sg.price_pos_lookback = max(5, min(30, int(sg.price_pos_lookback)))
-    sg.trend_strong_pct = max(0.003, min(0.08, sg.trend_strong_pct))
-    sg.volume_confirm_mult = max(0.3, min(1.5, sg.volume_confirm_mult))
-    sg.volume_strong_mult = max(1.0, min(4.0, sg.volume_strong_mult))
-    sg.bb_lower_touch_pct = max(0.00, min(0.05, sg.bb_lower_touch_pct))
-    sg.candle_strength_mult = max(0.1, min(2.0, sg.candle_strength_mult))
-    sg.big_candle_mult = max(0.3, min(3.0, sg.big_candle_mult))
-    
-    for attr in ["atr_stop_p1", "atr_stop_p2", "atr_stop_p3", "atr_stop_p4", "atr_stop_p5"]:
-        setattr(sg, attr, max(0.3, min(4.0, getattr(sg, attr))))
-    for attr in ["stop_margin_p1", "stop_margin_p2", "stop_margin_p3", "stop_margin_p4", "stop_margin_p5"]:
-        setattr(sg, attr, max(0.90, min(0.99, getattr(sg, attr))))
-    
-    valid_6 = set(range(1, 7))
-    if not (isinstance(sg.pattern_priority, list) and 
-            set(sg.pattern_priority) == valid_6 and 
-            len(sg.pattern_priority) == 6):
-        sg.pattern_priority = [3, 1, 2, 4, 5, 6]
-    
-    # ── RiskConfig ──
-    r.trail_atr_mult = max(1.0, min(5.0, r.trail_atr_mult))
-    r.pullback_exit_pct = max(0.005, min(0.08, r.pullback_exit_pct))
-    r.pullback_lookback = max(3, min(30, int(r.pullback_lookback)))
-    r.cooldown_after_loss = max(30, min(360, int(r.cooldown_after_loss)))
-    r.cooldown_after_win = max(5, min(120, int(r.cooldown_after_win)))
-    r.cooldown_default = max(1, min(30, int(r.cooldown_default)))
-    r.invest_capital_pct = max(0.20, min(0.90, r.invest_capital_pct))
-    r.risk_multiplier = max(2.0, min(20.0, r.risk_multiplier))
-    r.order_wait_sec = max(5, min(120, int(r.order_wait_sec)))
-    r.market_order_buffer = max(1.00, min(1.30, r.market_order_buffer))
-    r.available_krw_safety = max(0.70, min(0.99, r.available_krw_safety))
-    r.min_order_mult = max(0.5, min(5.0, r.min_order_mult))
-    r.auto_pass_confidence = max(0.80, min(0.99, r.auto_pass_confidence))
-    r.min_gate_confidence  = max(0.50, min(0.90, r.min_gate_confidence))
-    if r.min_gate_confidence >= r.auto_pass_confidence:
-        r.min_gate_confidence = r.auto_pass_confidence - 0.10  # 역전 방지
-    r.max_sleep_sec = max(60, min(300, int(r.max_sleep_sec)))
-    return cfg
+    def save_to_db(self, db_path: str, key: str = "ai_config"):
+        try:
+            con = sqlite3.connect(db_path)
+            cur = con.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+            cur.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (key, json.dumps(self.to_dict(), ensure_ascii=False)))
+            con.commit()
+            con.close()
+        except Exception as e:
+            LOG.error(f"[CFG] DB 저장 실패: {e}")
 
 # ============================================================
-# DB 함수들
+# SQLite DB (candles/trades/positions/meta)
 # ============================================================
 
-def init_db():
-    con = sqlite3.connect(CFG.db_path)
-    cur = con.cursor()
-    cur.execute("""
+class DB:
+    def __init__(self, path: str):
+        self.path = path
+        self._init()
+
+    @staticmethod
+    def _table_columns(cur: sqlite3.Cursor, table: str) -> set:
+        return {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _ensure_columns(self, cur: sqlite3.Cursor, table: str, cols: Dict[str, str]):
+        existing = self._table_columns(cur, table)
+        for col, ddl in cols.items():
+            if col not in existing:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+    def _init(self):
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS candles (
             ts INTEGER,
             market TEXT,
@@ -442,2041 +334,2011 @@ def init_db():
             trade_value REAL,
             PRIMARY KEY (ts, market, timeframe)
         )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS meta (
-            k TEXT PRIMARY KEY,
-            v TEXT
-        )
-    """)
-    
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS positions (
-        market       TEXT PRIMARY KEY,
-        entry_price  REAL,
-        entry_time   INTEGER,
-        size         REAL,
-        stop_loss    REAL,
-        direction    TEXT,
-        entry_fee    REAL,
-        signal_type  TEXT DEFAULT 'unknown',
-        confidence   REAL DEFAULT 0.0
-    )""")
-    
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS trades (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        market            TEXT,
-        direction         TEXT,
-        entry_price       REAL,
-        exit_price        REAL,
-        size              REAL,
-        entry_time        INTEGER,
-        exit_time         INTEGER,
-        pnl               REAL,
-        total_fee         REAL,
-        holding_hours     REAL,
-        exit_reason       TEXT,
-        signal_type       TEXT DEFAULT 'unknown',
-        confidence        REAL DEFAULT 0.0,
-        rsi_at_entry      REAL DEFAULT 0.0,
-        vol_ratio_at_entry REAL DEFAULT 0.0
-    )""")
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ai_learning (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER,
-            win_rate REAL,
-            avg_profit REAL,
-            avg_loss REAL,
-            total_trades INTEGER,
-            params_json TEXT,
-            strategy_json TEXT,
-            performance_score REAL
-        )
-    """)
-    con.commit()
-    
-    for col, default in [
-        ("signal_type",       "'unknown'"),
-        ("confidence",        "0.0"),
-        ("rsi_at_entry",      "0.0"),
-        ("vol_ratio_at_entry","0.0"),
-    ]:
-        try:
-            cur.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL DEFAULT {default}")
-        except Exception:
-            pass  # 이미 존재하면 무시
-
-    for col, default in [
-        ("signal_type", "'unknown'"),
-        ("confidence",  "0.0"),
-    ]:
-        try:
-            cur.execute(f"ALTER TABLE positions ADD COLUMN {col} REAL DEFAULT {default}")
-        except Exception:
-            pass
-
-    con.commit()
-    con.close()
-
-def db_put_candles(rows):
-    con = sqlite3.connect(CFG.db_path)
-    cur = con.cursor()
-    cur.executemany("""
-        INSERT OR REPLACE INTO candles
-        (ts, market, timeframe, open, high, low, close, volume, trade_value)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, rows)
-    con.commit()
-    con.close()
-
-def db_get_candles(market, timeframe, limit=300):
-    con = sqlite3.connect(CFG.db_path)
-    df = pd.read_sql_query("""
-        SELECT * FROM candles
-        WHERE market=? AND timeframe=?
-        ORDER BY ts DESC LIMIT ?
-    """, con, params=(market, timeframe, limit))
-    con.close()
-    return df.sort_values('ts').reset_index(drop=True) if not df.empty else df
-
-def db_set_meta(k, v):
-    con = sqlite3.connect(CFG.db_path)
-    cur = con.cursor()
-    cur.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, v))
-    con.commit()
-    con.close()
-
-def save_ai_change_summary(changes_text: str):
-    if not changes_text:
-        changes_text = "(변경 없음)"
-    payload = {
-        "ts": int(time.time()),
-        "text": changes_text
-    }
-    db_set_meta("last_ai_config_change", json.dumps(payload, ensure_ascii=False))
-
-def db_get_meta(k, default=None):
-    con = sqlite3.connect(CFG.db_path)
-    cur = con.cursor()
-    cur.execute("SELECT v FROM meta WHERE k=?", (k,))
-    r = cur.fetchone()
-    con.close()
-    return r[0] if r else default
-
-def db_get_positions():
-    con = sqlite3.connect(CFG.db_path)
-    df = pd.read_sql_query("SELECT * FROM positions", con)
-    con.close()
-    return df
-
-def db_add_position(market, entry_price, size, stop_loss, direction, entry_fee,
-                    signal_type='unknown', confidence=0.0):
-    con = sqlite3.connect(CFG.db_path)
-    cur = con.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO positions
-        (market, entry_price, entry_time, size, stop_loss, direction, entry_fee,
-         signal_type, confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (market, entry_price, int(time.time()), size, stop_loss, direction,
-          entry_fee, signal_type, confidence))
-    con.commit()
-    con.close()
-
-def db_remove_position(market):
-    con = sqlite3.connect(CFG.db_path)
-    cur = con.cursor()
-    cur.execute("DELETE FROM positions WHERE market=?", (market,))
-    con.commit()
-    con.close()
-
-def db_get_recent_trades(limit=100):
-    con = sqlite3.connect(CFG.db_path)
-    df = pd.read_sql_query("""
-        SELECT * FROM trades
-        ORDER BY exit_time DESC
-        LIMIT ?
-    """, con, params=(limit,))
-    con.close()
-    return df
-
-def db_get_recent_trades_by_market(market, limit=5):
-    con = sqlite3.connect(CFG.db_path)
-    df = pd.read_sql_query("""
-        SELECT * FROM trades
-        WHERE market=?
-        ORDER BY exit_time DESC
-        LIMIT ?
-    """, con, params=(market, limit))
-    con.close()
-    return df
-
-# ============================================================
-# [신규] 동일 종목 연속 손실 횟수 조회
-# ============================================================
-def get_consecutive_losses_by_market(market: str, limit: int = 10) -> int:
-    """
-    해당 종목의 가장 최근 거래부터 연속으로 손실(pnl <= 0)이
-    몇 번 이어졌는지 반환.
-    수익 거래가 나오는 순간 카운트 중단.
-    """
-    trades = db_get_recent_trades_by_market(market, limit=limit)
-    if trades.empty:
-        return 0
-    consecutive = 0
-    for _, row in trades.iterrows():   # exit_time DESC 순서
-        if float(row['pnl']) <= 0:
-            consecutive += 1
-        else:
-            break
-    return consecutive
-
-
-# ============================================================
-# [신규] 연속 손실 횟수 → 에스컬레이팅 쿨다운 계산
-# ============================================================
-def calc_escalating_cooldown(consecutive_losses: int, base_minutes: int) -> int:
-    """
-    연속 손실 횟수에 따라 쿨다운을 체증적으로 반환.
-
-    0회  : base          (기본값, 30분)
-    1회  : base × 1      (  30분)
-    2회  : base × 2      (  60분)
-    3회  : base × 4      ( 120분)
-    4회+ : base × 8      ( 240분, 4시간 하드 차단)
-    """
-    if consecutive_losses <= 0:
-        return base_minutes
-    elif consecutive_losses == 1:
-        return base_minutes
-    elif consecutive_losses == 2:
-        return base_minutes * 2
-    elif consecutive_losses == 3:
-        return base_minutes * 4
-    else:
-        return base_minutes * 8   # 4회 이상 → 4시간 차단
-
-
-# ============================================================
-# 유틸리티 함수들
-# ============================================================
-
-def is_excluded_coin(market):
-    if not market or '-' not in market:
-        return True
-    _, currency = market.split('-')
-    if currency.upper() in [x.upper() for x in CFG.exclude]:
-        return True
-    if len(currency) < 2:
-        return True
-    return False
-
-def analyze_trading_performance():
-    trades = db_get_recent_trades(limit=100)
-    if trades.empty:
-        return {
-            "total_trades": 0,
-            "win_rate": 0,
-            "avg_profit": 0,
-            "avg_loss": 0,
-            "profit_factor": 0,
-            "avg_holding_hours": 0,
-            "best_trade": 0,
-            "worst_trade": 0,
-            "total_pnl": 0,
-            "total_fees": 0
-        }
-    
-    winning_trades = trades[trades['pnl'] > 0]
-    losing_trades = trades[trades['pnl'] <= 0]
-    total_trades = len(trades)
-    win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0
-    avg_profit = winning_trades['pnl'].mean() if not winning_trades.empty else 0
-    avg_loss = abs(losing_trades['pnl'].mean()) if not losing_trades.empty else 0
-    total_profit = winning_trades['pnl'].sum() if not winning_trades.empty else 0
-    total_loss = abs(losing_trades['pnl'].sum()) if not losing_trades.empty else 0
-    profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
-    avg_holding_hours = trades['holding_hours'].mean() if 'holding_hours' in trades.columns else 0
-    
-    return {
-        "total_trades": total_trades,
-        "win_rate": win_rate,
-        "avg_profit": avg_profit,
-        "avg_loss": avg_loss,
-        "profit_factor": profit_factor,
-        "avg_holding_hours": avg_holding_hours,
-        "best_trade": trades['pnl'].max(),
-        "worst_trade": trades['pnl'].min(),
-        "total_pnl": trades['pnl'].sum(),
-        "total_fees": trades['total_fee'].sum()
-    }
-
-SIGNAL_TYPE_MAP = {
-    'pullback_ema20':        0,
-    'volatility_breakout':   1,
-    'rsi_oversold_bounce':   2,
-    'unknown':               3,
-}
-
-def _build_ml_features(trades_df: pd.DataFrame):
-    """
-    trades DataFrame → ML 학습용 X, y 반환
-    피처: signal_type(encoded), confidence, rsi_at_entry,
-          vol_ratio_at_entry, hour_of_day, holding_hours
-    레이블: pnl > 0 → 1 (승), else → 0 (패)
-    """
-    df = trades_df.copy()
-    df['label']         = (df['pnl'] > 0).astype(int)
-    df['signal_enc']    = df['signal_type'].map(SIGNAL_TYPE_MAP).fillna(3).astype(int)
-    df['confidence']    = pd.to_numeric(df.get('confidence',    0), errors='coerce').fillna(0.5)
-    df['rsi']           = pd.to_numeric(df.get('rsi_at_entry',  50), errors='coerce').fillna(50.0)
-    df['vol_ratio']     = pd.to_numeric(df.get('vol_ratio_at_entry', 1.0), errors='coerce').fillna(1.0)
-    df['holding_hours'] = pd.to_numeric(df.get('holding_hours', 2.0), errors='coerce').fillna(2.0)
-    df['hour_of_day']   = pd.to_datetime(df['exit_time'], unit='s').dt.hour
-
-    feature_cols = ['signal_enc', 'confidence', 'rsi', 'vol_ratio',
-                    'holding_hours', 'hour_of_day']
-    X = df[feature_cols].values
-    y = df['label'].values
-    return X, y, feature_cols
-
-
-def train_signal_quality_model():
-    """
-    trades 테이블 데이터로 GradientBoosting 분류 모델 학습.
-    최소 30건 이상일 때 실행. 학습 결과는 DB(meta)에 직렬화 저장.
-    """
-    try:
-        from sklearn.ensemble import GradientBoostingClassifier
-        from sklearn.model_selection import cross_val_score
-        import pickle, base64
-
-        trades = db_get_recent_trades(limit=500)
-        if len(trades) < 30:
-            logger.info(f"[ML] 학습 데이터 부족 ({len(trades)}건 < 30건) → 스킵")
-            return
-
-        X, y, feature_cols = _build_ml_features(trades)
-
-        model = GradientBoostingClassifier(
-            n_estimators=100,
-            max_depth=3,
-            learning_rate=0.1,
-            random_state=42
-        )
-        model.fit(X, y)
-
-        # 교차 검증 정확도
-        if len(trades) >= 50:
-            cv_scores = cross_val_score(model, X, y, cv=3, scoring='accuracy')
-            cv_acc = cv_scores.mean()
-        else:
-            cv_acc = model.score(X, y)
-
-        # 피처 중요도 로깅
-        importances = dict(zip(feature_cols, model.feature_importances_))
-        imp_str = ', '.join(f"{k}:{v:.2f}" for k, v in
-                            sorted(importances.items(), key=lambda x: -x[1]))
-
-        # DB 저장
-        db_set_meta("ml_signal_model", base64.b64encode(pickle.dumps(model)).decode())
-        db_set_meta("ml_model_ts", str(int(time.time())))
-
-        win_rate = y.mean() * 100
-        logger.info(
-            f"[ML] 모델 학습 완료 | 샘플 {len(trades)}건 "
-            f"| CV 정확도 {cv_acc*100:.1f}% | 실제 승률 {win_rate:.1f}%"
-        )
-        logger.info(f"[ML] 피처 중요도: {imp_str}")
-
-        # ai_learning 테이블에 이력 저장
-        perf = analyze_trading_performance()
-        con = sqlite3.connect(CFG.db_path)
-        cur = con.cursor()
+        """)
+        cur.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         cur.execute("""
-            INSERT INTO ai_learning
-            (timestamp, win_rate, avg_profit, avg_loss, total_trades,
-             params_json, strategy_json, performance_score)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (int(time.time()), perf['win_rate'], perf['avg_profit'],
-              perf['avg_loss'], perf['total_trades'],
-              json.dumps(importances), '{}', cv_acc))
+        CREATE TABLE IF NOT EXISTS equity_snapshots (
+            ts INTEGER PRIMARY KEY,
+            equity_krw REAL NOT NULL,
+            available_krw REAL NOT NULL,
+            position_count INTEGER NOT NULL,
+            note TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            market TEXT PRIMARY KEY,
+            entry_price REAL,
+            entry_time INTEGER,
+            size REAL,
+            stop_loss REAL,
+            direction TEXT,
+            entry_fee REAL,
+            signal_type TEXT,
+            score REAL,
+            order_id TEXT,
+            rsi_at_entry REAL,
+            vol_ratio_at_entry REAL,
+            tv_ma_at_entry REAL,
+            ml_prob REAL
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market TEXT,
+            direction TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            size REAL,
+            entry_time INTEGER,
+            exit_time INTEGER,
+            pnl REAL,
+            total_fee REAL,
+            holding_hours REAL,
+            exit_reason TEXT,
+            signal_type TEXT,
+            score REAL,
+            rsi_at_entry REAL,
+            vol_ratio_at_entry REAL,
+            tv_ma_at_entry REAL,
+            ml_prob REAL
+        )
+        """)
+
+        # Auto-migrate older DB schema safely (e.g., legacy bithumb_swing.db).
+        self._ensure_columns(cur, "positions", {
+            "signal_type": "TEXT DEFAULT 'unknown'",
+            "score": "REAL DEFAULT 0",
+            "order_id": "TEXT",
+            "rsi_at_entry": "REAL DEFAULT 50.0",
+            "vol_ratio_at_entry": "REAL DEFAULT 1.0",
+            "tv_ma_at_entry": "REAL DEFAULT 0.0",
+            "ml_prob": "REAL",
+        })
+        self._ensure_columns(cur, "trades", {
+            "signal_type": "TEXT DEFAULT 'unknown'",
+            "score": "REAL DEFAULT 0",
+            "rsi_at_entry": "REAL DEFAULT 50.0",
+            "vol_ratio_at_entry": "REAL DEFAULT 1.0",
+            "tv_ma_at_entry": "REAL DEFAULT 0.0",
+            "ml_prob": "REAL",
+        })
+        pos_cols = self._table_columns(cur, "positions")
+        if "confidence" in pos_cols and "score" in pos_cols:
+            cur.execute("""
+                UPDATE positions
+                SET score = confidence
+                WHERE confidence IS NOT NULL AND (score IS NULL OR score = 0)
+            """)
+        trade_cols = self._table_columns(cur, "trades")
+        if "confidence" in trade_cols and "score" in trade_cols:
+            cur.execute("""
+                UPDATE trades
+                SET score = confidence
+                WHERE confidence IS NOT NULL AND (score IS NULL OR score = 0)
+            """)
         con.commit()
         con.close()
 
-    except ImportError:
-        logger.warning("[ML] sklearn 미설치 → pip install scikit-learn")
-    except Exception as e:
-        logger.error(f"[ML] 모델 학습 실패: {e}")
+    def put_candles(self, rows: List[Tuple]):
+        if not rows:
+            return
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+        cur.executemany("""
+            INSERT OR REPLACE INTO candles
+            (ts, market, timeframe, open, high, low, close, volume, trade_value)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        con.commit()
+        con.close()
 
+    def get_candles(self, market: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
+        con = sqlite3.connect(self.path)
+        df = pd.read_sql_query("""
+            SELECT * FROM candles
+            WHERE market=? AND timeframe=?
+            ORDER BY ts DESC LIMIT ?
+        """, con, params=(market, timeframe, limit))
+        con.close()
+        if df.empty:
+            return df
+        return df.sort_values("ts").reset_index(drop=True)
 
-def predict_signal_quality(signal_type: str, confidence: float,
-                           rsi: float, vol_ratio: float) -> float:
-    """
-    학습된 모델로 현재 신호의 승률 확률을 반환.
-    모델이 없거나 오류 시 0.5(중립) 반환.
+    def set_meta(self, k: str, v: str):
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+        cur.execute("INSERT OR REPLACE INTO meta (k,v) VALUES (?,?)", (k, v))
+        con.commit()
+        con.close()
 
-    Returns: float 0.0~1.0 (승률 예측 확률)
-    """
+    def get_meta(self, k: str, default: Optional[str] = None) -> Optional[str]:
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+        cur.execute("SELECT v FROM meta WHERE k=?", (k,))
+        row = cur.fetchone()
+        con.close()
+        return row[0] if row else default
+
+    def upsert_position(self, pos: dict):
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+        cur.execute("""
+        INSERT OR REPLACE INTO positions
+        (market, entry_price, entry_time, size, stop_loss, direction, entry_fee, signal_type, score,
+         order_id, rsi_at_entry, vol_ratio_at_entry, tv_ma_at_entry, ml_prob)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            pos["market"], pos["entry_price"], pos["entry_time"], pos["size"], pos["stop_loss"],
+            pos["direction"], pos.get("entry_fee", 0.0), pos.get("signal_type", "unknown"), pos.get("score", 0.0),
+            pos.get("order_id", ""),
+            pos.get("rsi_at_entry", 50.0),
+            pos.get("vol_ratio_at_entry", 1.0),
+            pos.get("tv_ma_at_entry", 0.0),
+            pos.get("ml_prob", None),
+        ))
+        con.commit()
+        con.close()
+
+    def delete_position(self, market: str):
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+        cur.execute("DELETE FROM positions WHERE market=?", (market,))
+        con.commit()
+        con.close()
+
+    def get_positions(self) -> pd.DataFrame:
+        con = sqlite3.connect(self.path)
+        df = pd.read_sql_query("SELECT * FROM positions", con)
+        con.close()
+        return df
+
+    def insert_trade(self, t: dict):
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+        cur.execute("""
+        INSERT INTO trades
+        (market, direction, entry_price, exit_price, size, entry_time, exit_time, pnl, total_fee, holding_hours,
+         exit_reason, signal_type, score, rsi_at_entry, vol_ratio_at_entry, tv_ma_at_entry, ml_prob)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            t["market"], t["direction"], t["entry_price"], t["exit_price"], t["size"],
+            t["entry_time"], t["exit_time"], t["pnl"], t["total_fee"], t["holding_hours"],
+            t.get("exit_reason",""), t.get("signal_type","unknown"), t.get("score",0.0),
+            t.get("rsi_at_entry",50.0), t.get("vol_ratio_at_entry",1.0), t.get("tv_ma_at_entry",0.0),
+            t.get("ml_prob", None)
+        ))
+        con.commit()
+        con.close()
+
+    def recent_trades(self, limit: int = 200) -> pd.DataFrame:
+        con = sqlite3.connect(self.path)
+        df = pd.read_sql_query("""
+            SELECT * FROM trades
+            ORDER BY id DESC LIMIT ?
+        """, con, params=(limit,))
+        con.close()
+        if df.empty:
+            return df
+        return df.sort_values("id").reset_index(drop=True)
+
+    def insert_equity_snapshot(self, ts: int, equity_krw: float, available_krw: float, position_count: int, note: str = ""):
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO equity_snapshots
+            (ts, equity_krw, available_krw, position_count, note)
+            VALUES (?, ?, ?, ?, ?)
+        """, (int(ts), float(equity_krw), float(available_krw), int(position_count), note))
+        con.commit()
+        con.close()
+
+    def get_last_equity_snapshot_before(self, ts: int) -> Optional[dict]:
+        con = sqlite3.connect(self.path)
+        cur = con.cursor()
+        cur.execute("""
+            SELECT ts, equity_krw, available_krw, position_count, note
+            FROM equity_snapshots
+            WHERE ts <= ?
+            ORDER BY ts DESC
+            LIMIT 1
+        """, (int(ts),))
+        row = cur.fetchone()
+        con.close()
+        if not row:
+            return None
+        return {
+            "ts": int(row[0]),
+            "equity_krw": float(row[1]),
+            "available_krw": float(row[2]),
+            "position_count": int(row[3]),
+            "note": row[4] or "",
+        }
+
+    def recent_equity_snapshots(self, limit: int = 36) -> pd.DataFrame:
+        con = sqlite3.connect(self.path)
+        df = pd.read_sql_query("""
+            SELECT * FROM equity_snapshots
+            ORDER BY ts DESC LIMIT ?
+        """, con, params=(limit,))
+        con.close()
+        if df.empty:
+            return df
+        return df.sort_values("ts").reset_index(drop=True)
+
+# ============================================================
+# Bithumb API (Public + Private JWT)
+# ============================================================
+
+def build_http_session() -> requests.Session:
+    sess = requests.Session()
+    if Retry is None:
+        return sess
+    retry_kwargs = dict(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=0.35,
+        status_forcelist=(429, 500, 502, 503, 504),
+        raise_on_status=False,
+    )
     try:
-        import pickle, base64
-        raw = db_get_meta("ml_signal_model")
-        if not raw:
-            return 0.5
-
-        model = pickle.loads(base64.b64decode(raw))
-
-        from datetime import datetime
-        hour_of_day   = datetime.now().hour
-        holding_hours = 2.0   # 예상 보유 시간 (평균값 사용)
-        signal_enc    = SIGNAL_TYPE_MAP.get(signal_type, 3)
-
-        X = [[signal_enc, confidence, rsi, vol_ratio, holding_hours, hour_of_day]]
-        prob = float(model.predict_proba(X)[0][1])
-        return prob
-
-    except Exception as e:
-        logger.debug(f"[ML] 예측 실패 (무시): {e}")
-        return 0.5
-
-# ============================================================
-# Bithumb API
-# ============================================================
-
-class BithumbPrivateAPI:
-    def __init__(self):
-        self.api_url = "https://api.bithumb.com"
-        self.api_key = os.getenv("BITHUMB_API_KEY")
-        self.api_secret = os.getenv("BITHUMB_SECRET_KEY")
-        if not self.api_key or not self.api_secret:
-            raise ValueError("[ERROR] 환경변수에 BITHUMB_API_KEY와 BITHUMB_SECRET_KEY를 설정해주세요")
-        self.sess = requests.Session()
-    
-    def _create_jwt_token(self, query_params=None):
-        import uuid
-        payload = {
-            'access_key': self.api_key,
-            'nonce': str(uuid.uuid4()),
-            'timestamp': round(time.time() * 1000)
-        }
-        if query_params:
-            query_string = urllib.parse.urlencode(query_params, doseq=True).encode('utf-8')
-            query_hash = hashlib.sha512(query_string).hexdigest()
-            payload['query_hash'] = query_hash
-            payload['query_hash_alg'] = 'SHA512'
-        token = jwt.encode(payload, self.api_secret, algorithm='HS256')
-        if isinstance(token, bytes):
-            token = token.decode('utf-8')
-        return f'Bearer {token}'
-    
-    def _api_call(self, method, endpoint, params=None, is_query=False):
-        try:
-            url = self.api_url + endpoint
-            if is_query and params:
-                authorization = self._create_jwt_token(params)
-                headers = {
-                    'Authorization': authorization,
-                    'Content-Type': 'application/json'
-                }
-                response = self.sess.request(method, url, params=params, headers=headers, timeout=10)
-            else:
-                authorization = self._create_jwt_token(params)
-                headers = {
-                    'Authorization': authorization,
-                    'Content-Type': 'application/json'
-                }
-                response = self.sess.request(method, url, json=params, headers=headers, timeout=10)
-            
-            try:
-                response.raise_for_status()
-                result = response.json()
-            except requests.HTTPError as e:
-                logger.error(f"[ERROR] HTTP {response.status_code} {response.text}")
-                raise
-            
-            if 'error' in result:
-                logger.error(f"[ERROR] API 에러: {result['error']['message']}")
-                return None
-            return result
-        except requests.exceptions.Timeout:
-            logger.error(f"[ERROR] API 타임아웃: {endpoint}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"[ERROR] API 요청 실패: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"[ERROR] 예상치 못한 오류: {e}")
-            return None
-    
-    def get_accounts(self):
-        endpoint = "/v1/accounts"
-        return self._api_call("GET", endpoint)
-    
-    def get_order_chance(self, market):
-        endpoint = "/v1/orders/chance"
-        params = {"market": market}
-        return self._api_call("GET", endpoint, params, is_query=True)
-    
-    def place_order(self, market, side, volume=None, price=None, ord_type="limit"):
-        endpoint = "/v1/orders"
-        params = {
-            "market": market,
-            "side": side,
-            "ord_type": ord_type
-        }
-        if volume:
-            params["volume"] = str(volume)
-        if price:
-            params["price"] = str(price)
-        return self._api_call("POST", endpoint, params)
-    
-    def cancel_order(self, uuid):
-        endpoint = "/v1/order"
-        params = {"uuid": uuid}
-        return self._api_call("DELETE", endpoint, params, is_query=True)
-    
-    def get_order(self, uuid):
-        endpoint = "/v1/order"
-        params = {"uuid": uuid}
-        return self._api_call("GET", endpoint, params, is_query=True)
+        retry = Retry(allowed_methods=frozenset({"GET", "POST", "DELETE"}), **retry_kwargs)
+    except TypeError:
+        # urllib3<1.26 compatibility
+        retry = Retry(method_whitelist=frozenset({"GET", "POST", "DELETE"}), **retry_kwargs)  # type: ignore[call-arg]
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
 
 class BithumbPublic:
-    def __init__(self):
-        self.sess = requests.Session()
-        self.base_url = "https://api.bithumb.com"
-    
-    def get_markets(self):
-        url = f"{self.base_url}/v1/market/all"
+    def __init__(self, sess: Optional[requests.Session] = None):
+        self.base = "https://api.bithumb.com"
+        self.sess = sess or build_http_session()
+
+    def ticker_all_krw(self) -> Optional[dict]:
+        url = f"{self.base}/public/ticker/ALL_KRW"
         try:
-            resp = self.sess.get(url, timeout=10)
-            resp.raise_for_status()
-            return resp.json()
+            r = self.sess.get(url, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            if j.get("status") != "0000":
+                return None
+            return j.get("data")
         except Exception as e:
-            logger.error(f"[ERROR] 마켓 코드 조회 실패: {e}")
-            return []
-    
-    def get_30m_candles(self, market: str, count: int = 300, to: str = None):
-        url = f"{self.base_url}/v1/candles/minutes/30"
-        params = {
-            "market": market,
-            "count": min(count, 300)
+            LOG.error(f"[PUBLIC] ticker ALL failed: {e}")
+            return None
+
+    def ticker_one(self, symbol: str, payment: str = "KRW") -> Optional[dict]:
+        url = f"{self.base}/public/ticker/{symbol}_{payment}"
+        try:
+            r = self.sess.get(url, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            if j.get("status") != "0000":
+                return None
+            return j.get("data")
+        except Exception as e:
+            LOG.error(f"[PUBLIC] ticker {symbol} failed: {e}")
+            return None
+
+    def candlestick(self, symbol: str, interval: str = "15m", payment: str = "KRW") -> Optional[List[list]]:
+        # Official endpoint: /public/candlestick/{order_currency}_{payment_currency}/{chart_intervals}
+        # Supports: 1m,3m,5m,10m,15m,30m,1h,4h,6h,12h,24h,1w,1mm (per Bithumb API docs search snippet)
+        url = f"{self.base}/public/candlestick/{symbol}_{payment}/{interval}"
+        try:
+            r = self.sess.get(url, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            if j.get("status") != "0000":
+                return None
+            return j.get("data")
+        except Exception as e:
+            LOG.error(f"[PUBLIC] candle {symbol} {interval} failed: {e}")
+            return None
+
+class BithumbPrivate:
+    """
+    Bithumb OpenAPI (JWT Authorization Bearer) implementation.
+    Docs: '인증 헤더 만들기' shows payload fields and query_hash method.
+    """
+    def __init__(self, api_key: str, secret_key: str, sess: Optional[requests.Session] = None):
+        self.base = "https://api.bithumb.com"
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.sess = sess or build_http_session()
+
+    def _jwt(self, params: Optional[dict] = None) -> str:
+        payload = {
+            "access_key": self.api_key,
+            "nonce": str(uuid.uuid4()),
+            "timestamp": round(time.time() * 1000),
         }
-        if to:
-            params["to"] = to
+        if params:
+            query = urllib.parse.urlencode(params, doseq=True).encode("utf-8")
+            query_hash = hashlib.sha512(query).hexdigest()
+            payload["query_hash"] = query_hash
+            payload["query_hash_alg"] = "SHA512"
+        token = jwt.encode(payload, self.secret_key, algorithm="HS256")
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+        return f"Bearer {token}"
+
+    def _request(self, method: str, path: str, params: Optional[dict] = None, query: bool = False) -> Optional[dict]:
+        url = f"{self.base}{path}"
+        headers = {"Authorization": self._jwt(params), "Content-Type": "application/json"}
         try:
-            resp = self.sess.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            return resp.json()
+            if method.upper() == "GET":
+                r = self.sess.get(url, params=params if query else None, headers=headers, timeout=10)
+            elif method.upper() == "DELETE":
+                r = self.sess.delete(url, params=params if query else None, headers=headers, timeout=10)
+            else:  # POST/PUT
+                r = self.sess.request(method.upper(), url, json=params or {}, headers=headers, timeout=10)
+            r.raise_for_status()
+            return r.json()
         except Exception as e:
-            logger.error(f"[ERROR] {market} 캔들 조회 실패: {e}")
-            return []
-    
-    def get_15m_candles(self, market: str, count: int = 300):
-        url = f"{self.base_url}/v1/candles/minutes/15"
-        params = {"market": market, "count": min(count, 300)}
-        try:
-            resp = self.sess.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"[ERROR] {market} 15m 캔들 조회 실패: {e}")
-            return []
-    
-    def get_current_price(self, market: str):
-        if is_excluded_coin(market):
+            LOG.error(f"[PRIVATE] {method} {path} failed: {e} | resp={getattr(getattr(e, 'response', None), 'text', '')}")
             return None
-        url = f"{self.base_url}/v1/ticker"
-        params = {"markets": market}
-        try:
-            resp = self.sess.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            if data and len(data) > 0:
-                return float(data[0]['trade_price'])
-            return None
-        except Exception as e:
-            logger.error(f"[ERROR] {market} 현재가 조회 실패: {e}")
-            return None
-        
-    def get_hour_candles(self, market: str, count: int = 100):
-        """1시간봉 캔들 조회"""
-        url = f"{self.base_url}/v1/candles/minutes/60"
-        params = {"market": market, "count": min(count, 200)}
-        try:
-            resp = self.sess.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"[ERROR] {market} 1H 캔들 조회 실패: {e}")
-            return []
+
+    def accounts(self) -> Optional[list]:
+        # GET /v1/accounts (docs)
+        return self._request("GET", "/v1/accounts", None, query=True)
+
+    def order_chance(self, market: str) -> Optional[dict]:
+        return self._request("GET", "/v1/orders/chance", {"market": market}, query=True)
+
+    def order_get(self, uuid_: str) -> Optional[dict]:
+        return self._request("GET", "/v1/order", {"uuid": uuid_}, query=True)
+
+    def orders_list(self, market: str, state: str = "wait", limit: int = 20, page: int = 1, order_by: str = "desc") -> Optional[list]:
+        return self._request("GET", "/v1/orders", {"market": market, "state": state, "limit": limit, "page": page, "order_by": order_by}, query=True)
+
+    def place_order_v1(self, body: dict) -> Optional[dict]:
+        return self._request("POST", "/v1/orders", body, query=False)
+
+    def cancel_order_v1(self, uuid_: str) -> Optional[dict]:
+        return self._request("DELETE", "/v1/order", {"uuid": uuid_}, query=True)
+
+    def place_order_beta(self, body: dict) -> Optional[dict]:
+        # POST /v2/orders (docs)
+        return self._request("POST", "/v2/orders", body, query=False)
+
+    def cancel_order_beta(self, order_id: str) -> Optional[dict]:
+        # DELETE /v2/order?order_id=... (docs)
+        return self._request("DELETE", "/v2/order", {"order_id": order_id}, query=True)
 
 # ============================================================
-# 수수료 및 잔고 함수
+# Helpers: indicators / tick size / rounding
 # ============================================================
 
-def calculate_buy_fee_and_total(price, size):
-    amount = price * size
-    fee = amount * CFG.fee_rate
-    total = amount + fee
-    return {
-        "amount": amount,
-        "fee": fee,
-        "total": total
-    }
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").ewm(span=span, adjust=False).mean()
 
-def calculate_sell_fee_and_net(price, size):
-    amount = price * size
-    fee = amount * CFG.fee_rate
-    net = amount - fee
-    return {
-        "amount": amount,
-        "fee": fee,
-        "net": net
-    }
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/period, min_periods=period).mean()
+    ma_down = down.ewm(alpha=1/period, min_periods=period).mean()
+    rs = ma_up / ma_down.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-def get_available_krw_balance():
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, min_periods=period).mean()
+
+def format_price(p: float) -> str:
     try:
-        api = BithumbPrivateAPI()
-        result = api.get_accounts()
-        if result:
-            for account in result:
-                if account['currency'] == 'KRW':
-                    return float(account['balance'])
-        return 0
-    except Exception as e:
-        logger.error(f"[ERROR] KRW 잔고 조회 실패: {e}")
-        return 0
-
-def get_coin_balance(market):
-    if is_excluded_coin(market):
-        return 0
-    try:
-        api = BithumbPrivateAPI()
-        result = api.get_accounts()
-        currency = market.split('-')[1]
-        if result:
-            for account in result:
-                if account['currency'].upper() == currency.upper():
-                    return float(account['balance'])
-        return 0
-    except Exception as e:
-        logger.error(f"[ERROR] {market} 잔고 조회 실패: {e}")
-        return 0
-
-def get_total_portfolio_value(exclude_coins=None):
-    if exclude_coins is None:
-        exclude_coins = CFG.exclude
-    try:
-        api = BithumbPrivateAPI()
-        pub = BithumbPublic()
-        accounts = api.get_accounts()
-        if not accounts:
-            return {"krw": 0, "coins": {}, "total_coin_value": 0, "total_krw": 0}
-        
-        krw_balance = 0
-        coins_value = {}
-        total_coin_value = 0
-        
-        for account in accounts:
-            currency = account['currency']
-            balance = float(account['balance'])
-            if currency == 'KRW':
-                krw_balance = balance
-                continue
-            if currency.upper() in [x.upper() for x in exclude_coins]:
-                continue
-            if balance > 0:
-                market = f"KRW-{currency}"
-                current_price = pub.get_current_price(market)
-                if current_price:
-                    value_krw = balance * current_price
-                    coins_value[currency] = {
-                        "balance": balance,
-                        "price": current_price,
-                        "value_krw": value_krw
-                    }
-                    total_coin_value += value_krw
-        
-        total_value = krw_balance + total_coin_value
-        return {
-            "krw": krw_balance,
-            "coins": coins_value,
-            "total_coin_value": total_coin_value,
-            "total_krw": total_value
-        }
-    except Exception as e:
-        logger.error(f"[ERROR] 포트폴리오 가치 계산 실패: {e}")
-        return {"krw": 0, "coins": {}, "total_coin_value": 0, "total_krw": 0}
-
-def print_portfolio_summary():
-    portfolio = get_total_portfolio_value()
-    logger.info(f"{'='*60}")
-    logger.info(f"[PORTFOLIO] AI 관리 자산 요약")
-    logger.info(f" (BTC, ETH 등 수동 투자 자산 제외)")
-    logger.info(f"{'='*60}")
-    logger.info(f"KRW 잔고: {portfolio['krw']:,.0f}원")
-    logger.info(f"코인 평가액: {portfolio['total_coin_value']:,.0f}원")
-    logger.info(f"총 자산: {portfolio['total_krw']:,.0f}원")
-    if portfolio['coins']:
-        logger.info(f"AI 관리 코인 ({len(portfolio['coins'])}개):")
-        for coin, info in sorted(portfolio['coins'].items(), 
-                                key=lambda x: x[1]['value_krw'], 
-                                reverse=True):
-            logger.info(f" - {coin}: {info['balance']:.6f} "
-                       f"= {info['value_krw']:,.0f}원 (@ {info['price']:,.0f})")
-    logger.info(f"{'='*60}\n")
-
-# ============================================================
-# 기술적 지표
-# ============================================================
-
-def calculate_atr(df, period=14):
-    if len(df) < period + 1:
-        return pd.Series([0] * len(df))
-    high = df['high']
-    low = df['low']
-    close = df['close'].shift(1)
-    tr1 = high - low
-    tr2 = abs(high - close)
-    tr3 = abs(low - close)
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-    return atr.fillna(0)
-
-def calculate_ma(df, period):
-    if len(df) < period:
-        return pd.Series([0] * len(df))
-    return df['close'].rolling(period).mean().fillna(0)
-
-def parse_candles_to_rows(candles_data, market, timeframe="30m"):
-    rows = []
-    for candle in candles_data:
-        try:
-            ts = candle.get("timestamp", 0) // 1000
-            o = float(candle.get("opening_price", 0))
-            h = float(candle.get("high_price", 0))
-            l = float(candle.get("low_price", 0))
-            c = float(candle.get("trade_price", 0))
-            v = float(candle.get("candle_acc_trade_volume", 0))
-            tv = float(candle.get("candle_acc_trade_price", 0))
-            rows.append((ts, market, timeframe, o, h, l, c, v, tv))
-        except (ValueError, TypeError, KeyError):
-            continue
-    return rows
-
-def collect_candles(markets):
-    pub = BithumbPublic()
-    for market in markets:
-        if is_excluded_coin(market):
-            continue
-        try:
-            # 15분봉
-            candles_15m = pub.get_15m_candles(market, count=300)
-            if candles_15m:
-                rows_15m = parse_candles_to_rows(candles_15m, market, "15m")
-                if rows_15m:
-                    db_put_candles(rows_15m)
-            
-            # 30분봉
-            candles_30m = pub.get_30m_candles(market, count=300)
-            if candles_30m:
-                rows = parse_candles_to_rows(candles_30m, market, "30m")
-                if rows:
-                    db_put_candles(rows)
-
-            # 신규: 1시간봉 추가 수집
-            candles_1h = pub.get_hour_candles(market, count=100)
-            if candles_1h:
-                rows_1h = parse_candles_to_rows(candles_1h, market, "1h")
-                if rows_1h:
-                    db_put_candles(rows_1h)
-
-        except Exception as e:
-            logger.error(f"[ERROR] {market} 캔들 수집 실패: {e}")
-        time.sleep(0.15)   # 요청 간격 약간 늘림 (API 2회 호출)
-
-# ============================================================
-# [신규] BTC 캔들 전용 수집 (거래 제외 / 지표 참조 전용)
-# exclude 목록 우회하여 DB에 저장
-# ============================================================
-def collect_btc_reference_candles():
-    """
-    BTC는 실거래 대상이 아니지만 시장 체제 분석용으로
-    캔들 데이터를 별도 수집하여 DB에 저장.
-    collect_candles()의 is_excluded_coin 체크를 우회.
-    """
-    BTC_MARKET = "KRW-BTC"
-    pub = BithumbPublic()
-    try:
-        # 30분봉 (ai_analyze_market_regime에서 사용)
-        candles_30m = pub.get_30m_candles(BTC_MARKET, count=60)
-        if candles_30m:
-            rows = parse_candles_to_rows(candles_30m, BTC_MARKET, "30m")
-            if rows:
-                db_put_candles(rows)
-
-        # 1시간봉 (장기 추세 참조용)
-        candles_1h = pub.get_hour_candles(BTC_MARKET, count=60)
-        if candles_1h:
-            rows_1h = parse_candles_to_rows(candles_1h, BTC_MARKET, "1h")
-            if rows_1h:
-                db_put_candles(rows_1h)
-
-        logger.info(f"[BTC_REF] KRW-BTC 캔들 수집 완료 (30m/1h)")
-
-    except Exception as e:
-        logger.error(f"[BTC_REF] KRW-BTC 캔들 수집 실패: {e}")
-
-
-# ============================================================
-# 신호 생성 (SignalConfig 적용)
-# ============================================================
-def generate_swing_signals(market, params: Params, strategy: StrategyConfig, sig_cfg: SignalConfig) -> dict:
-    df_1h = db_get_candles(market, "1h", limit=50)
-    if len(df_1h) >= 20:
-        ema20_1h = df_1h["close"].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema60_1h = df_1h["close"].ewm(span=60, adjust=False).mean().iloc[-1] if len(df_1h) >= 60 else ema20_1h
-        current_1h = float(df_1h["close"].iloc[-1])
-
-        # 1시간봉 기준으로도 EMA 아래면 하락장 판단
-        if current_1h < ema60_1h * 0.99 and ema20_1h < ema60_1h:
-            return {"signal": "hold", "reason": "downtrend_1h"}
-        
-    if is_excluded_coin(market):
-        return {"signal": "hold", "reason": "excluded_coin"}
-
-    df_15m = db_get_candles(market, "15m", limit=300)
-    if len(df_15m) < params.trend_ma_slow + 5:
-        return {"signal": "hold", "reason": "insufficient_data"}
-
-    df_15m["ema_fast"] = df_15m["close"].ewm(span=params.trend_ma_fast, adjust=False).mean()
-    df_15m["ema_slow"] = df_15m["close"].ewm(span=params.trend_ma_slow, adjust=False).mean()
-
-    delta = df_15m["close"].diff()
-    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14).mean()
-    df_15m["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
-    df_15m["atr"] = calculate_atr(df_15m, 14)
-
-    df_15m["bb_mid"] = df_15m["close"].rolling(20).mean()
-    bb_std = df_15m["close"].rolling(20).std()
-    df_15m["bb_upper"] = df_15m["bb_mid"] + bb_std * 2
-    df_15m["volume_ma"] = df_15m["volume"].rolling(20).mean()
-
-    last = df_15m.iloc[-1]
-    current_price = float(last["close"])
-    atr = float(last["atr"])
-    rsi = float(last["rsi"])
-
-    if current_price is None or current_price <= 0 or atr <= 0 or pd.isna(atr):
-        return {"signal": "hold", "reason": "invalid_data"}
-
-    # ✅ 하락장 이유 명시
-    is_uptrend = current_price > last["ema_slow"] * 0.98
-    if not is_uptrend:
-        return {"signal": "hold", "reason": "downtrend"}
-
-    # ✅ RSI 이유 명시
-    if rsi >= sig_cfg.rsi_max:
-        return {"signal": "hold", "reason": "rsi_too_high"}
-    if rsi <= sig_cfg.rsi_min:
-        return {"signal": "hold", "reason": "rsi_too_low"}
-
-    dist_to_ema20 = (current_price - last["ema_fast"]) / current_price
-    is_pullback = (
-        abs(dist_to_ema20) <= 0.020 and
-        current_price > last["ema_fast"] and
-        sig_cfg.rsi_min < rsi < sig_cfg.rsi_max
-    )
-
-    dist_to_ema20 = (current_price - last["ema_fast"]) / current_price
-    is_pullback = (
-        abs(dist_to_ema20) <= 0.020 and
-        current_price > last["ema_fast"] and
-        sig_cfg.rsi_min < rsi < sig_cfg.rsi_max
-    )
-
-    is_breakout = (
-        current_price > last["bb_upper"] and
-        last["volume"] > last["volume_ma"] * sig_cfg.volume_strong_mult and
-        sig_cfg.rsi_oversold < rsi < sig_cfg.rsi_overbought
-    )
-
-    # RSI 과매도 반등 패턴
-    prev_rsi = float(df_15m["rsi"].iloc[-2]) if len(df_15m) >= 2 else rsi
-    is_rsi_bounce = (
-        rsi < sig_cfg.rsi_oversold and                        # RSI가 과매도 구간 (기본 35 이하)
-        rsi > sig_cfg.rsi_min and                             # rsi_min(20) 이상 — 극단적 붕괴 제외
-        prev_rsi < rsi and                                    # 직전 캔들보다 RSI 상승 (반등 시작 확인)
-        last["volume"] > last["volume_ma"] * 0.8 and          # 최소 거래량 확인 (급락 이후 거래 회복)
-        current_price > last["ema_slow"] * 0.95               # EMA60 기준 -5% 이내 (너무 깊은 붕괴 제외)
-    )
-
-    # is_rsi_bounce가 없으면 기존 로직 그대로
-    if not is_pullback and not is_breakout and not is_rsi_bounce:
-        if last["volume"] < last["volume_ma"] * sig_cfg.volume_confirm_mult:
-            return {"signal": "hold", "reason": "low_volume"}
-        return {"signal": "hold", "reason": "no_pattern_match"}
-
-    # signal_type 결정 순서: rsi_bounce 최우선 (반등 초기 진입이 핵심)
-    signal_type = None
-    if is_rsi_bounce:
-        signal_type = "rsi_oversold_bounce"
-    elif is_pullback:
-        signal_type = "pullback_ema20"
-    elif is_breakout:
-        signal_type = "volatility_breakout"
-
-    if signal_type:
-        sl_price = current_price - (atr * params.atr_mult_stop)
-        MIN_STOP_DIST = 0.013  # 최소 1.3% 손절 거리 보장
-        if sl_price > current_price * (1 - MIN_STOP_DIST):
-            return {"signal": "hold", "reason": "stop_too_tight"}
-        confidence = calculate_signal_confidence(signal_type, last, sig_cfg)
-        return {
-            "signal": "buy",
-            "price": current_price,
-            "stop": float(sl_price),
-            "atr": atr,
-            "reason": signal_type,
-            "confidence": confidence
-        }  # ✅ 이유 추가
-
-    return {"signal": "hold", "reason": "no_pattern_match"}
-
-def calculate_signal_confidence(signal_type: str, last, sig_cfg: SignalConfig) -> float:
-    """
-    다중 지표 가중합산 신뢰도 계산 (반환 범위: 0.50 ~ 0.95)
-    
-    pullback_ema20:       RSI위치 + EMA근접도 + 추세강도 + 거래량 + 캔들바디
-    volatility_breakout:  거래량폭발 + BB돌파강도 + RSI여유 + 캔들바디 + 추세방향
-    """
-    current_price = float(last["close"])
-    open_price    = float(last["open"])
-    rsi           = float(last["rsi"])
-    atr           = float(last["atr"]) if float(last["atr"]) > 0 else 1.0
-    volume        = float(last["volume"])
-    volume_ma     = float(last["volume_ma"]) if not pd.isna(last["volume_ma"]) and float(last["volume_ma"]) > 0 else 1.0
-    ema_fast      = float(last["ema_fast"])
-    ema_slow      = float(last["ema_slow"]) if float(last["ema_slow"]) > 0 else 1.0
-    bb_upper      = float(last["bb_upper"])
-    bb_mid        = float(last["bb_mid"])
-
-    vol_ratio      = volume / volume_ma
-    trend_strength = (ema_fast - ema_slow) / ema_slow  # 양수 = 상승추세
-    body_ratio     = (current_price - open_price) / atr  # 양봉 강도
-
-    score = 0.0
-
-    if signal_type == "pullback_ema20":
-        # [1] RSI 위치 (이상적: 38~55) — 최대 0.25
-        if 38 <= rsi <= 55:
-            score += 0.25
-        elif rsi < 38:
-            score += 0.20  # 약간 과매도: 반등 여지 있음
-        else:
-            score += max(0.0, 0.25 - (rsi - 55) * 0.012)  # 55 초과시 선형 감점
-
-        # [2] EMA20 근접도 — 최대 0.25
-        dist = abs((current_price - ema_fast) / current_price)
-        if dist <= 0.005:   score += 0.25
-        elif dist <= 0.010: score += 0.20
-        elif dist <= 0.015: score += 0.15
-        else:               score += 0.08
-
-        # [3] 추세 강도 (EMA20 vs EMA60) — 최대 0.20
-        if trend_strength > 0.020:   score += 0.20
-        elif trend_strength > 0.008: score += 0.15
-        elif trend_strength > 0.000: score += 0.10
-        else:                        score += 0.04  # 완만한 역배열
-
-        # [4] 거래량 — 최대 0.15
-        if vol_ratio >= 1.5:   score += 0.15
-        elif vol_ratio >= 1.0: score += 0.10
-        elif vol_ratio >= 0.7: score += 0.05
-        else:                  score += 0.00
-
-        # [5] 캔들 바디 (양봉 확인) — 최대 0.15
-        if body_ratio > 0.8:   score += 0.15
-        elif body_ratio > 0.3: score += 0.08
-        elif body_ratio > 0.0: score += 0.03
-        else:                  score += 0.00  # 음봉
-
-    elif signal_type == "volatility_breakout":
-        # [1] 거래량 폭발 (핵심 조건) — 최대 0.30
-        if vol_ratio >= 3.0:   score += 0.30
-        elif vol_ratio >= 2.0: score += 0.25
-        elif vol_ratio >= 1.5: score += 0.18
-        else:                  score += 0.08
-
-        # [2] BB 돌파 강도 — 최대 0.25
-        bb_range = (bb_upper - bb_mid) if (bb_upper - bb_mid) > 0 else 1.0
-        breakout_extent = (current_price - bb_upper) / bb_range
-        if breakout_extent > 0.5:   score += 0.25
-        elif breakout_extent > 0.2: score += 0.20
-        elif breakout_extent > 0.0: score += 0.12
-        else:                       score += 0.05
-
-        # [3] RSI 여유 (과매수 아닐수록 추가 상승 여지) — 최대 0.20
-        if rsi < 55:         score += 0.20
-        elif rsi < 65:       score += 0.15
-        elif rsi < 72:       score += 0.10
-        else:                score += 0.03  # 과매수 구간
-
-        # [4] 캔들 바디 강도 — 최대 0.15
-        if body_ratio > 1.2:   score += 0.15
-        elif body_ratio > 0.6: score += 0.10
-        elif body_ratio > 0.0: score += 0.04
-        else:                  score += 0.00
-
-        # [5] 추세 방향 보너스 — 최대 0.10
-        if trend_strength > 0.010:   score += 0.10
-        elif trend_strength > 0.000: score += 0.05
-        else:                        score += 0.00
-        
-    elif signal_type == "rsi_oversold_bounce":
-        # [1] RSI 깊이 — 과매도가 깊을수록 반등 가능성 높음 (최대 0.30)
-        rsi_depth = max(0.0, sig_cfg.rsi_oversold - rsi)  # ex) 35 - 28 = 7
-        score += min(0.30, rsi_depth * 0.03)              # 깊이 10 = 0.30 만점
-
-        # [2] RSI 방향 전환 강도 (최대 0.25)
-        rsi_prev = float(last.get("rsi", rsi))  # 이미 last는 df[-1]이므로 prev는 외부에서 넘기거나 생략
-        # → generate_swing_signals에서 prev_rsi를 넘기지 않으므로 거래량으로 대체
-        if vol_ratio >= 1.5: score += 0.25
-        elif vol_ratio >= 1.0: score += 0.18
-        elif vol_ratio >= 0.8: score += 0.10
-        else: score += 0.03
-
-        # [3] 양봉 확인 (반등 캔들인지) (최대 0.25)
-        if body_ratio > 0.8:  score += 0.25
-        elif body_ratio > 0.4: score += 0.15
-        elif body_ratio > 0.0: score += 0.08
-        else: score += 0.00   # 음봉이면 반등 신뢰도 낮음
-
-        # [4] EMA60 대비 가격 위치 — 너무 멀리 떨어지지 않았는지 (최대 0.20)
-        ema_slow_val = ema_slow if ema_slow > 0 else current_price
-        dist_from_ema60 = abs(current_price - ema_slow_val) / ema_slow_val
-        if dist_from_ema60 <= 0.03:  score += 0.20
-        elif dist_from_ema60 <= 0.06: score += 0.12
-        else: score += 0.05
-
-    return round(max(0.50, min(0.95, score)), 3)
-
-# ============================================================
-# 포지션 청산 (RiskConfig 적용)
-# ============================================================
-
-def check_position_exit(market: str, current_price: float, position_row, 
-                       params: Params, strategy: StrategyConfig, risk_cfg: RiskConfig):
-    """포지션 청산 판단"""
-    if is_excluded_coin(market):
-        return False, None
-    
-    try:
-        entry_price = float(position_row["entry_price"])
-        stop_loss = float(position_row["stop_loss"])
-        direction = position_row.get("direction", "long")
-        entry_time = float(position_row["entry_time"])
+        p = float(p)
     except Exception:
-        return False, None
-    
-    if entry_price <= 0 or current_price is None or current_price <= 0:
-        return False, None
-    
-    profit_pct = ((current_price - entry_price) / entry_price
-                 if direction == "long"
-                 else (entry_price - current_price) / entry_price)
-    
-    max_loss = float(strategy.max_loss_per_trade)
-    take_profit = float(strategy.take_profit_pct)
-    trail_start = float(strategy.trailing_stop_profit_threshold)
-    time_stop_h = float(strategy.time_stop_hours)
-    trail_mult = float(risk_cfg.trail_atr_mult)
-    pullback_pct = float(risk_cfg.pullback_exit_pct)
-    pb_lookback = int(risk_cfg.pullback_lookback)
-    
-    # 1) Stop-loss
-    if direction == "long" and current_price <= stop_loss:
-        logger.info(f" [STOP_LOSS] {market} {current_price:,.0f} <= {stop_loss:,.0f}")
-        return True, "stop_loss"
-    if direction == "short" and current_price >= stop_loss:
-        logger.info(f" [STOP_LOSS] {market} {current_price:,.0f} >= {stop_loss:,.0f}")
-        return True, "stop_loss"
-    
-    # 2) 최대 손실
-    if profit_pct <= -max_loss:
-        logger.info(f" [MAX_LOSS] {market} {profit_pct*100:.2f}% (limit {max_loss*100:.2f}%)")
-        return True, "max_loss"
-    
-    # 3) 목표 수익
-    if profit_pct >= take_profit:
-        logger.info(f" [TAKE_PROFIT] {market} {profit_pct*100:.2f}% (target {take_profit*100:.2f}%)")
-        return True, "take_profit"
-    
-    # 4) 시간 기반 청산
-    holding_h = (time.time() - entry_time) / 3600.0
-    if holding_h >= time_stop_h and profit_pct <= 0:
-        logger.info(f" [TIME_STOP] {market} {holding_h:.1f}h {profit_pct*100:.2f}%")
-        return True, "time_stop"
-    
-    # 5) Pullback 청산
-    if profit_pct >= max(trail_start, 0.008):
-        df = db_get_candles(market, "15m", limit=pb_lookback + 5)
-        if len(df) >= pb_lookback:
-            recent_high = float(df["high"].tail(pb_lookback).max())
-            if recent_high > 0:
-                pb = (recent_high - current_price) / recent_high
-                if pb >= pullback_pct:
-                    logger.info(f" [PULLBACK] {market} -{pb*100:.2f}%")
-                    return True, "pullback_from_profit"
-    
-    # 6) 트레일링 스톱 업데이트
-    if direction == "long" and profit_pct >= trail_start:
-        df = db_get_candles(market, "15m", limit=150)
-        if len(df) >= 14:
-            atr_s = calculate_atr(df, 14)
-            atr = float(atr_s.iloc[-1]) if len(atr_s) > 0 else 0.0
-            if atr > 0:
-                trailing = current_price - atr * trail_mult
-                if trailing > stop_loss:
-                    try:
-                        con = sqlite3.connect(CFG.db_path)
-                        cur = con.cursor()
-                        cur.execute("UPDATE positions SET stop_loss=? WHERE market=?",
-                                   (trailing, market))
-                        con.commit()
-                        con.close()
-                        logger.info(f" [TRAILING] {market} {stop_loss:,.0f}→{trailing:,.0f}")
-                    except Exception as e:
-                        logger.error(f"[ERROR] trailing stop 업데이트 실패: {e}")
-    
-    return False, None
+        return str(p)
+    if p < 1:
+        return f"{p:,.6f}"
+    if p < 10:
+        return f"{p:,.4f}"
+    if p < 100:
+        return f"{p:,.2f}"
+    return f"{p:,.0f}"
 
-def get_bithumb_tick_size(price: float) -> float:
-    """빗썸 호가 단위 반환"""
-    if price >= 2_000_000:  return 1000
-    elif price >= 1_000_000: return 500
-    elif price >= 500_000:   return 200
-    elif price >= 100_000:   return 100
-    elif price >= 10_000:    return 50
-    elif price >= 1_000:     return 10
-    elif price >= 100:       return 5
-    elif price >= 10:        return 1
-    elif price >= 1:         return 0.1
-    elif price >= 0.1:       return 0.01
-    elif price >= 0.01:      return 0.001
-    else:                    return 0.0001
+def normalize_krw_amount(krw: float) -> int:
+    return int(max(0, math.floor(float(krw))))
+
+def format_signed_krw(v: float) -> str:
+    v = float(v)
+    sign = "+" if v > 0 else ""
+    return f"{sign}{v:,.0f} KRW"
+
+def format_signed_pct(v: float) -> str:
+    v = float(v)
+    sign = "+" if v > 0 else ""
+    return f"{sign}{v * 100:.2f}%"
+
+def safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+def format_order_volume(volume: float, max_dp: int = 8) -> str:
+    v = max(0.0, float(volume))
+    s = f"{v:.{max_dp}f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+def get_bithumb_tick_size_krw(price: float) -> float:
+    """
+    Conservative tick size table.
+    Note: Bithumb announced that for 100~1000 KRW range, tick changed from 0.1 to 1 KRW (2023-11-30).
+    """
+    p = float(price)
+    if p >= 2_000_000: return 1000.0
+    if p >= 1_000_000: return 500.0
+    if p >= 500_000:   return 200.0
+    if p >= 100_000:   return 100.0
+    if p >= 10_000:    return 50.0
+    if p >= 1_000:     return 10.0
+    if p >= 100:       return 1.0    # changed from 0.1 -> 1 in that band
+    if p >= 10:        return 1.0
+    if p >= 1:         return 0.1
+    if p >= 0.1:       return 0.01
+    if p >= 0.01:      return 0.001
+    return 0.0001
 
 def round_to_tick(price: float) -> float:
-    """호가 단위에 맞게 가격 반올림"""
-    tick = get_bithumb_tick_size(price)
+    tick = get_bithumb_tick_size_krw(price)
+    if tick <= 0:
+        return float(price)
     return round(round(price / tick) * tick, 10)
 
-# ============================================================
-# 주문 실행 (RiskConfig 적용)
-# ============================================================
-def execute_order(market: str, direction: str, price: float, size: float, risk_cfg: RiskConfig = None):
-    """주문 실행"""
-    if risk_cfg is None:
-        risk_cfg = RiskConfig()
+def latest_vol_ratio(df: pd.DataFrame, window: int = 20) -> float:
+    if df is None or df.empty:
+        return 1.0
+    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+    ma = vol.rolling(window).mean()
+    v = float(vol.iloc[-1] or 0.0)
+    m = float(ma.iloc[-1] or 0.0)
+    if m <= 0:
+        return 1.0
+    return float(max(0.0, min(10.0, v / m)))
 
-    if is_excluded_coin(market):
-        return {"success": False, "order_id": None, "message": "Excluded coin", "fee": 0}
-
-    if price is None or price <= 0:
-        logger.error(f"[ERROR] {market} 잘못된 가격: {price}")
-        return {"success": False, "order_id": None, "message": "Invalid price", "fee": 0}
-
-    if size is None or size <= 0:
-        logger.error(f"[ERROR] {market} 잘못된 수량: {size}")
-        return {"success": False, "order_id": None, "message": "Invalid size", "fee": 0}
-
-    if direction == "buy":
-        min_order = CFG.min_order_krw * risk_cfg.min_order_mult
-        if price * size < min_order:
-            logger.error(f"[ERROR] {market} 최소 주문 미달(매수): {price*size:,.0f}원")
-            return {"success": False, "order_id": None, "message": "Below minimum order", "fee": 0}
-
-    api = BithumbPrivateAPI()
-    wait_sec = risk_cfg.order_wait_sec
-
-    if direction == "buy":
-        tick = get_bithumb_tick_size(price)
-        adjusted_price = price + tick  # 1틱 위 지정가 (상승 종목도 체결)
-        tick_price = round_to_tick(adjusted_price)
-        logger.info(f"[ORDER] {market} 호가단위 조정: {price} → {tick_price} (tick={tick}, +1틱 상향)")
-        result = api.place_order(market=market, side="bid",
-                                price=str(tick_price),
-                                volume=str(round(size, 8)),
-                                ord_type="limit")
-
-        if not result or "uuid" not in result:
-            logger.error(f"[ERROR] {market} 매수 주문 접수 실패")
-            return {"success": False, "order_id": None, "message": "Order failed", "fee": 0}
-
-        order_id = result["uuid"]
-        logger.info(f"[BUY ORDER] {market} 지정가 매수 접수 | 가격: {price:,.0f} | 수량: {size:.6f} | 대기: {wait_sec}초")
-
-        # 체결 대기 루프
-        start = time.time()
-        while time.time() - start < wait_sec:
-            order = api.get_order(order_id)
-            if order and order.get("state") == "done":
-                fee = calculate_buy_fee_and_total(price, size)["fee"]
-                logger.info(f"[BUY FILLED] {market} 완전 체결 | 수량: {size:.6f}")
-                return {"success": True, "order_id": order_id, "message": "Filled", "fee": fee}
-            time.sleep(1)
-
-        # 타임아웃 — 미체결 주문 취소, 시장가 재주문 없음
-        order = api.get_order(order_id)
-        exec_vol = 0.0
-        if order:
-            exec_vol = float(order.get("executed_volume", 0))
-
-        try:
-            api.cancel_order(order_id)
-            logger.info(f"[CANCEL] {market} {wait_sec}초 타임아웃 → 주문 취소 "
-                        f"(체결: {exec_vol:.6f} / 미체결: {size - exec_vol:.6f})")
-        except Exception as e:
-            logger.warning(f"[CANCEL] {market} 주문 취소 중 오류: {e}")
-
-        # 부분 체결이 있으면 부분 성공으로 반환
-        if exec_vol > 0:
-            fee = calculate_buy_fee_and_total(price, exec_vol)["fee"]
-            logger.info(f"[PARTIAL] {market} 부분 체결 포지션 등록 | 체결량: {exec_vol:.6f}")
-            return {"success": True, "order_id": order_id,
-                    "message": f"Partial filled ({exec_vol:.6f}), rest cancelled", "fee": fee}
-
-        # 완전 미체결 → 실패
-        return {"success": False, "order_id": None,
-                "message": f"Timeout after {wait_sec}s, order cancelled", "fee": 0}
-
-    else:  # sell
-        pub = BithumbPublic()
-        cur_mkt_price = pub.get_current_price(market) or price
-        result = api.place_order(market=market, side="ask",
-                                 volume=str(size), ord_type="market")
-        if result and "uuid" in result:
-            fee = calculate_sell_fee_and_net(cur_mkt_price, size)["fee"]
-            return {"success": True, "order_id": result["uuid"], "message": "Market sell", "fee": fee}
-        return {"success": False, "order_id": None, "message": "Sell failed", "fee": 0}
-
+def trade_value_ma(df: pd.DataFrame, window: int = 20) -> float:
+    if df is None or df.empty:
+        return 0.0
+    tv = pd.to_numeric(df["trade_value"], errors="coerce").fillna(0.0)
+    return float(tv.rolling(window).mean().iloc[-1] or 0.0)
 
 # ============================================================
-# [1단계] 시장 분석가 (Market Analyst)
+# ML filter (optional, rewritten to be soft instead of hard SKIP at 35%)
 # ============================================================
-def ai_analyze_market_regime() -> str:
+
+ML_FEATURE_COLS = ["signal_type_enc", "score", "rsi", "vol_ratio", "tv_ma", "hour"]
+
+SIGNAL_TYPE_MAP = {
+    "pullback_ema20": 0,
+    "breakout": 1,
+    "rsi_bounce": 2,
+    "unknown": 3,
+}
+
+def _build_ml_df(trades: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if trades is None or trades.empty:
+        return None
+    df = trades.copy()
+    df["label"] = (pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0) > 0).astype(int)
+    df["signal_type_enc"] = df["signal_type"].map(SIGNAL_TYPE_MAP).fillna(3).astype(int)
+    df["score"] = pd.to_numeric(df.get("score", 0.0), errors="coerce").fillna(0.0)
+    df["rsi"] = pd.to_numeric(df.get("rsi_at_entry", 50.0), errors="coerce").fillna(50.0)
+    df["vol_ratio"] = pd.to_numeric(df.get("vol_ratio_at_entry", 1.0), errors="coerce").fillna(1.0)
+    df["tv_ma"] = pd.to_numeric(df.get("tv_ma_at_entry", 0.0), errors="coerce").fillna(0.0)
+    df["hour"] = pd.to_datetime(df["entry_time"], unit="s").dt.hour.astype(int)
+    keep = df.dropna(subset=["label"])
+    if keep.empty:
+        return None
+    return keep
+
+def train_ml_model(db: DB, min_trades: int = 50) -> Optional[str]:
     """
-    [1단계: 시장 분석가]
-    비트코인(KRW-BTC)의 최근 30분봉을 분석하여 현재 시장 장세를 판단합니다.
-    이 데이터는 2단계(전략 사령관)의 파라미터 조절 근거로 사용됩니다.
+    Train a simple model and store it in meta as base64(pickle).
+    Uses time-aware split (last 20% as validation) to reduce leakage.
     """
-    if not CFG.ollama_url or not CFG.ollama_model:
-        return "Unknown Regime (Ollama not configured)"
-        
     try:
-        # 비트코인 30분봉 최근 20개 가져오기
-        btc_df = db_get_candles("KRW-BTC", "30m", limit=20)
-        if btc_df is None or btc_df.empty:
-            logger.warning("[BTC_REF] DB에 KRW-BTC 30m 데이터 없음 → collect_btc_reference_candles() 즉시 재시도")
-            collect_btc_reference_candles()                     # 즉시 재수집 시도
-            btc_df = db_get_candles("KRW-BTC", "30m", limit=20) # 재조회
-            if btc_df is None or btc_df.empty:
-                return "Unknown Regime No BTC data"
-                    
-        # AI가 읽기 쉽게 데이터 텍스트화
-        chart_text = ""
-        for i, row in btc_df.iterrows():
-            change = (row['close'] - row['open']) / row['open'] * 100
-            chart_text += f"- Close: {row['close']:,.0f} | Change: {change:+.2f}% | Vol: {row['volume']:.2f}\n"
-            
-        prompt = f"""
-        You are a Master Crypto Market Analyst.
-        Analyze the recent 30-minute candle data for Bitcoin (KRW-BTC) below.
-        
-        Recent BTC Data:
-        {chart_text}
-        
-        Task:
-        Determine the current macro market regime from the following options:
-        [Strong Uptrend, Weak Uptrend, Sideways/Choppy, Weak Downtrend, Strong Downtrend, Extreme Volatility]
-        
-        Respond ONLY in the following exact JSON format. Do NOT wrap in markdown code blocks:
-        {{
-            "regime": "selected option here",
-            "reason": "1 concise sentence explaining why"
-        }}
-        """
-        
-        # Ollama API 호출 (JSON 포맷 강제 및 온도 조절 적용)
+        from sklearn.ensemble import GradientBoostingClassifier
+        import pickle
+
+        trades = db.recent_trades(limit=1000)
+        if trades.empty or len(trades) < min_trades:
+            return None
+        df = _build_ml_df(trades)
+        if df is None or len(df) < min_trades:
+            return None
+
+        df = df.sort_values("entry_time")
+        X = df[ML_FEATURE_COLS].values
+        y = df["label"].values
+
+        split = int(len(df) * 0.8)
+        X_train, y_train = X[:split], y[:split]
+        X_val, y_val = X[split:], y[split:]
+
+        model = GradientBoostingClassifier(random_state=42)
+        model.fit(X_train, y_train)
+        val_acc = float(model.score(X_val, y_val)) if len(y_val) >= 10 else float(model.score(X_train, y_train))
+
         payload = {
-            "model": CFG.ollama_model,
-            "messages": [
-                {"role": "system", "content": "You are a precise crypto market regime classifier. Always respond in valid JSON only."},
-                {"role": "user",   "content": prompt}
-            ],
-            "stream": False,
-            "format": "json",           # json mode 강제
-            "options": {
-                "temperature": 0.2,
-                "num_predict": 600,
-                "num_ctx": 8192,
-                "top_p": 0.95
+            "model": base64.b64encode(pickle.dumps(model)).decode("utf-8"),
+            "trained_at": datetime.now().isoformat(),
+            "val_acc": val_acc,
+            "n": int(len(df)),
+        }
+        db.set_meta("ml_model", json.dumps(payload))
+        LOG.info(f"[ML] 모델 학습 완료: n={len(df)}, val_acc={val_acc:.3f}")
+        return json.dumps(payload)
+    except Exception as e:
+        LOG.debug(f"[ML] 학습 실패(무시): {e}")
+        return None
+
+def predict_ml_prob(db: DB, signal_type: str, score: float, rsi_v: float, vol_ratio: float, tv_ma: float) -> float:
+    try:
+        import pickle
+        raw = db.get_meta("ml_model")
+        if not raw:
+            return 0.5
+        payload = json.loads(raw)
+        model = pickle.loads(base64.b64decode(payload["model"]))
+        hour = datetime.now().hour
+        X = np.array([[SIGNAL_TYPE_MAP.get(signal_type, 3), score, rsi_v, vol_ratio, tv_ma, hour]], dtype=float)
+        p = float(model.predict_proba(X)[0][1])
+        return max(0.0, min(1.0, p))
+    except Exception:
+        return 0.5
+
+def get_ml_model_meta(db: DB) -> dict:
+    try:
+        raw = db.get_meta("ml_model")
+        if not raw:
+            return {}
+        payload = json.loads(raw)
+        return {
+            "trained_at": payload.get("trained_at"),
+            "val_acc": safe_float(payload.get("val_acc"), 0.0),
+            "n": int(safe_float(payload.get("n"), 0.0)),
+        }
+    except Exception:
+        return {}
+
+# ============================================================
+# Strategy: signal scoring (no hard "no_pattern_match")
+# ============================================================
+
+@dataclass
+class Signal:
+    market: str
+    symbol: str
+    price: float
+    signal_type: str
+    score: float
+    rsi: float
+    vol_ratio: float
+    tv_ma: float
+    stop_loss: float
+    take_profit: float
+    meta: dict = field(default_factory=dict)
+
+def compute_stop_loss(
+    entry: float,
+    atr_value: float,
+    cfg: AIConfig,
+    relaxed: bool = False,
+    max_stop_pct_override: Optional[float] = None,
+    clamp_when_wide: bool = False,
+) -> Tuple[Optional[float], str]:
+    p = float(entry)
+    atr_mult = float(cfg.params.atr_mult_stop)
+    raw_dist = max(0.0, float(atr_value) * atr_mult)
+    min_dist = max(p * cfg.params.min_stop_pct, 3.0 * get_bithumb_tick_size_krw(p))
+    dist = max(raw_dist, min_dist)
+
+    base_cap = cfg.params.max_stop_pct_relaxed if relaxed else cfg.params.max_stop_pct
+    hard_cap = float(max_stop_pct_override if max_stop_pct_override is not None else base_cap)
+    reject_cap = hard_cap * (1.25 if relaxed else 1.10)
+
+    width = dist / max(p, 1e-12)
+    if width > reject_cap:
+        return None, f"stop_too_wide({width:.1%})"
+
+    if width > hard_cap:
+        if clamp_when_wide or relaxed:
+            dist = p * hard_cap
+            reason = f"stop_clamped({width:.1%}->{hard_cap:.1%})"
+        else:
+            return None, f"stop_too_wide({width:.1%})"
+    else:
+        reason = "ok"
+
+    sl = round_to_tick(p - dist)
+    if sl >= p:
+        sl = round_to_tick(p - min_dist)
+    if sl >= p * (1.0 - cfg.params.min_stop_pct * 0.5):
+        sl = round_to_tick(sl - get_bithumb_tick_size_krw(sl) * 2)
+
+    return float(sl), reason
+def score_signal(df: pd.DataFrame, cfg: AIConfig) -> Optional[Tuple[str, float, dict]]:
+    """
+    Returns (signal_type, score, meta) or None.
+    Score is 0~1.
+    """
+    if df is None or df.empty or len(df) < 80:
+        return None
+    d = df.copy()
+    close = pd.to_numeric(d["close"], errors="coerce")
+    high = pd.to_numeric(d["high"], errors="coerce")
+    low = pd.to_numeric(d["low"], errors="coerce")
+    vol = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
+
+    e20 = ema(close, 20)
+    e60 = ema(close, 60)
+    r = rsi(close, 14)
+    a = atr(d, cfg.params.atr_period)
+
+    # last values
+    p = float(close.iloc[-1])
+    p_prev = float(close.iloc[-2])
+    e20v = float(e20.iloc[-1])
+    e60v = float(e60.iloc[-1])
+    rsiv = float(r.iloc[-1])
+    atrv = float(a.iloc[-1] if not math.isnan(float(a.iloc[-1])) else 0.0)
+
+    # volume ratio and trade value
+    d["trade_value"] = pd.to_numeric(d.get("trade_value", close * vol), errors="coerce").fillna(close * vol)
+    vr = latest_vol_ratio(d, 20)
+    tv = trade_value_ma(d, 20)
+
+    # basic trend score: prefer p > e60 and e20 > e60
+    trend = 0.0
+    if p > e60v:
+        trend += 0.20
+    if e20v > e60v:
+        trend += 0.20
+    if (p - e20v) / max(1e-9, e20v) > 0:
+        trend += 0.05
+
+    # volume score (soft)
+    vol_score = 0.0
+    if vr >= cfg.filters.min_vol_ratio_soft:
+        vol_score = 0.15
+    elif vr >= cfg.filters.min_vol_ratio_hard:
+        vol_score = 0.08
+    else:
+        vol_score = 0.0
+
+    # --- Candidate 1: Pullback EMA20 rebound ---
+    # conditions: in uptrend-ish, price near/under ema20 and bouncing
+    pullback_score = 0.0
+    pullback_ok = False
+    dist_to_e20 = abs(p - e20v) / max(1e-9, e20v)
+    if e20v > 0 and dist_to_e20 <= 0.008:  # within 0.8%
+        pullback_score += 0.25
+        pullback_ok = True
+    if p > p_prev:
+        pullback_score += 0.08
+    if rsiv < 60:
+        pullback_score += 0.05
+
+    # --- Candidate 2: Breakout ---
+    breakout_score = 0.0
+    lookback = 20
+    recent_high = float(high.tail(lookback).max())
+    if recent_high > 0 and p >= recent_high * 0.998:
+        breakout_score += 0.25
+        if p > p_prev:
+            breakout_score += 0.05
+        if vr >= 1.0:
+            breakout_score += 0.10
+
+    # --- Candidate 3: RSI bounce (mean reversion) ---
+    rsi_score = 0.0
+    if rsiv <= 34:
+        rsi_score += 0.22
+        if p > p_prev:
+            rsi_score += 0.08
+        if p > e20v * 0.995:
+            rsi_score += 0.05
+
+    # Pick best
+    candidates = [
+        ("pullback_ema20", pullback_score),
+        ("breakout", breakout_score),
+        ("rsi_bounce", rsi_score),
+    ]
+    best_type, best_pat = max(candidates, key=lambda x: x[1])
+
+    # If none of patterns "fire", still allow a small trend+volume setup
+    base = trend + vol_score
+    score = base + best_pat
+
+    # mild penalties
+    # avoid very overbought
+    if rsiv > 78:
+        score -= 0.15
+    # avoid very weak trend unless it is rsi bounce
+    if best_type != "rsi_bounce" and p < e60v * 0.995:
+        score -= 0.12
+
+    meta = {
+        "trend_score": trend,
+        "vol_score": vol_score,
+        "pattern_score": best_pat,
+        "rsiv": rsiv,
+        "atr": atrv,
+        "e20": e20v,
+        "e60": e60v,
+        "vr": vr,
+        "tv_ma": tv,
+        "recent_high": recent_high,
+    }
+
+    score = float(max(0.0, min(1.0, score)))
+    return best_type, score, meta
+
+# ============================================================
+# Risk state & cooldown
+# ============================================================
+
+def now_ts() -> int:
+    return int(time.time())
+
+def parse_json(s: Optional[str], default: Any):
+    if not s:
+        return default
+    try:
+        return json.loads(s)
+    except Exception:
+        return default
+
+def coin_block_key(market: str) -> str:
+    return f"block_until:{market}"
+
+def get_block_until(db: DB, market: str) -> int:
+    return int(float(db.get_meta(coin_block_key(market), "0") or 0))
+
+def set_block_until(db: DB, market: str, seconds: int, reason: str):
+    until = now_ts() + int(seconds)
+    db.set_meta(coin_block_key(market), str(until))
+    LOG.info(f"HARD_BLOCK {market} {seconds//60}min | {reason}")
+
+def is_blocked(db: DB, market: str) -> Tuple[bool, int]:
+    until = get_block_until(db, market)
+    if until > now_ts():
+        return True, until - now_ts()
+    return False, 0
+
+def compute_loss_stats(trades: pd.DataFrame) -> Tuple[int, int]:
+    if trades is None or trades.empty:
+        return 0, 0
+    last10 = trades.tail(10)
+    losses = int((pd.to_numeric(last10["pnl"], errors="coerce").fillna(0.0) <= 0).sum())
+    return losses, int(len(last10))
+
+# ============================================================
+# Exchange abstraction: live vs dry-run (paper)
+# ============================================================
+
+class Exchange:
+    def get_balances(self) -> Dict[str, float]:
+        raise NotImplementedError
+    def get_price_krw(self, symbol: str) -> Optional[float]:
+        raise NotImplementedError
+    def place_market_buy_krw(self, market: str, krw_amount: float) -> Tuple[bool, str, float]:
+        """returns (ok, order_id, fee_paid_krw)"""
+        raise NotImplementedError
+    def place_market_sell_all(self, market: str, volume: float) -> Tuple[bool, str, float]:
+        raise NotImplementedError
+
+class PaperExchange(Exchange):
+    def __init__(self, public: BithumbPublic, db: DB, fee_rate: float):
+        self.public = public
+        self.db = db
+        self.fee_rate = fee_rate
+        # paper balances in meta
+        st = parse_json(db.get_meta("paper_balances"), None)
+        if not st:
+            st = {"KRW": float(PAPER_INITIAL_KRW)}  # default paper cash
+            db.set_meta("paper_balances", json.dumps(st))
+
+    def _load(self) -> dict:
+        return parse_json(self.db.get_meta("paper_balances"), {"KRW": 0.0})
+    def _save(self, st: dict):
+        self.db.set_meta("paper_balances", json.dumps(st))
+
+    def get_balances(self) -> Dict[str, float]:
+        return self._load()
+
+    def get_price_krw(self, symbol: str) -> Optional[float]:
+        t = self.public.ticker_one(symbol, "KRW")
+        if not t:
+            return None
+        try:
+            return float(t["closing_price"])
+        except Exception:
+            return None
+
+    def place_market_buy_krw(self, market: str, krw_amount: float) -> Tuple[bool, str, float]:
+        # market like "KRW-ETH"
+        symbol = market.split("-")[1]
+        if market_is_excluded(market):
+            return False, "", 0.0
+        price = self.get_price_krw(symbol)
+        if not price or price <= 0:
+            return False, "", 0.0
+        st = self._load()
+        if st.get("KRW", 0.0) < krw_amount:
+            return False, "", 0.0
+        fee = krw_amount * self.fee_rate
+        net = max(0.0, krw_amount - fee)
+        vol = net / price
+        st["KRW"] -= krw_amount
+        st[symbol] = st.get(symbol, 0.0) + vol
+        self._save(st)
+        return True, f"paper-buy-{uuid.uuid4()}", fee
+
+    def place_market_sell_all(self, market: str, volume: float) -> Tuple[bool, str, float]:
+        symbol = market.split("-")[1]
+        if market_is_excluded(market):
+            return False, "", 0.0
+        price = self.get_price_krw(symbol)
+        if not price or price <= 0:
+            return False, "", 0.0
+        st = self._load()
+        have = st.get(symbol, 0.0)
+        if have <= 0:
+            return False, "", 0.0
+        vol = min(have, volume)
+        gross = vol * price
+        fee = gross * self.fee_rate
+        net = gross - fee
+        st[symbol] = have - vol
+        st["KRW"] = st.get("KRW", 0.0) + net
+        self._save(st)
+        return True, f"paper-sell-{uuid.uuid4()}", fee
+
+class LiveExchange(Exchange):
+    def __init__(self, public: BithumbPublic, private: BithumbPrivate, fee_rate: float):
+        self.public = public
+        self.private = private
+        self.fee_rate = fee_rate
+
+    def get_account_rows(self) -> List[dict]:
+        acc = self.private.accounts()
+        if not acc:
+            return []
+        if isinstance(acc, dict):
+            acc = acc.get("data", [])
+        if not isinstance(acc, list):
+            return []
+        return [a for a in acc if isinstance(a, dict)]
+
+    def get_balances(self) -> Dict[str, float]:
+        acc = self.private.accounts()
+        out: Dict[str, float] = {}
+        if not acc:
+            return out
+        if isinstance(acc, dict):
+            acc = acc.get("data", [])
+        if not isinstance(acc, list):
+            return out
+        # expected shape: list of dicts with currency, balance, locked ...
+        for a in acc:
+            try:
+                cur = a.get("currency")
+                balance = float(a.get("balance", 0.0) or 0.0)
+                locked = float(a.get("locked", 0.0) or 0.0)
+                available = a.get("available", None)
+                if available is None:
+                    bal = max(0.0, balance - locked if locked > 0 else balance)
+                else:
+                    bal = max(0.0, float(available or 0.0))
+                if cur:
+                    out[cur.upper()] = bal
+            except Exception:
+                continue
+        return out
+
+    def get_price_krw(self, symbol: str) -> Optional[float]:
+        t = self.public.ticker_one(symbol, "KRW")
+        if not t:
+            return None
+        try:
+            return float(t["closing_price"])
+        except Exception:
+            return None
+
+    def place_market_buy_krw(self, market: str, krw_amount: float) -> Tuple[bool, str, float]:
+        if market_is_excluded(market):
+            return False, "", 0.0
+        spend_krw = normalize_krw_amount(krw_amount)
+        if spend_krw <= 0:
+            return False, "", 0.0
+
+        available_krw = float(self.get_balances().get("KRW", 0.0))
+        if available_krw > 0:
+            # Keep a small buffer for fee/latency/slippage to reduce insufficient_funds.
+            live_cap = normalize_krw_amount(available_krw * (1.0 - self.fee_rate - 0.002))
+            if live_cap <= 0:
+                return False, "", 0.0
+            spend_krw = min(spend_krw, live_cap)
+        if spend_krw <= 0:
+            return False, "", 0.0
+
+        body_v1 = {
+            "market": market,
+            "side": "bid",
+            "price": str(spend_krw),
+            "ord_type": "price",
+        }
+        # /v1 is currently more stable for KRW market-buy by price.
+        resp = self.private.place_order_v1(body_v1)
+        if not resp:
+            body_v2 = {
+                "market": market,
+                "side": "bid",
+                "price": str(spend_krw),
+                "order_type": "price",
             }
+            resp = self.private.place_order_beta(body_v2)
+        if not resp:
+            return False, "", 0.0
+        order_id = resp.get("uuid") or resp.get("order_id") or resp.get("id") or ""
+        fee = spend_krw * self.fee_rate  # estimate; real fee needs fills endpoint
+        return True, str(order_id), fee
+
+    def place_market_sell_all(self, market: str, volume: float) -> Tuple[bool, str, float]:
+        if market_is_excluded(market):
+            return False, "", 0.0
+        vol = max(0.0, float(volume))
+        if vol <= 0:
+            return False, "", 0.0
+        body_v1 = {
+            "market": market,
+            "side": "ask",
+            "volume": format_order_volume(vol),
+            "ord_type": "market",
+        }
+        resp = self.private.place_order_v1(body_v1)
+        if not resp:
+            body_v2 = {
+                "market": market,
+                "side": "ask",
+                "volume": format_order_volume(vol),
+                "order_type": "market",
+            }
+            resp = self.private.place_order_beta(body_v2)
+        if not resp:
+            return False, "", 0.0
+        order_id = resp.get("uuid") or resp.get("order_id") or resp.get("id") or ""
+        # fee estimate from price unknown until filled; we approximate 0 for now
+        return True, str(order_id), 0.0
+
+# ============================================================
+# Ollama helper (optional)
+# ============================================================
+
+class OllamaClient:
+    def __init__(self, url: str, default_model: str, fast_model: str, timeout: int = 20):
+        self.url = url.rstrip("/")
+        self.default_model = default_model
+        self.fast_model = fast_model
+        self.timeout = timeout
+        self.sess = build_http_session()
+
+    def chat(self, messages: List[dict], fast: bool = False) -> Optional[str]:
+        model = self.fast_model if fast else self.default_model
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "keep_alive": "15m",
+        }
+        try:
+            r = self.sess.post(self.url, json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            j = r.json()
+            msg = j.get("message") or {}
+            content = (msg.get("content") or "").strip()
+            return content or None
+        except Exception as e:
+            LOG.debug(f"[OLLAMA] 호출 실패(무시): {e}")
+            return None
+
+# ============================================================
+# Core bot
+# ============================================================
+
+class TradingBot:
+    def __init__(self, db_path: str, dry_run: bool = True):
+        self.db = DB(db_path)
+        self.cfg = AIConfig.load_from_db(db_path)
+        self.public = BithumbPublic()
+        self.dry_run = dry_run
+
+        api_key = os.getenv("BITHUMB_API_KEY")
+        secret = os.getenv("BITHUMB_SECRET_KEY")
+
+        if not dry_run and api_key and secret:
+            self.private = BithumbPrivate(api_key, secret)
+            self.ex = LiveExchange(self.public, self.private, self.cfg.params.fee_rate)
+            LOG.info("[MODE] LIVE trading enabled")
+        else:
+            self.private = None
+            self.ex = PaperExchange(self.public, self.db, self.cfg.params.fee_rate)
+            LOG.info("[MODE] DRY_RUN (paper) enabled")
+
+        self.hold_counter = Counter()
+        self.gate_reject_counter = Counter()
+        self.no_fill_streak = int(self.db.get_meta("no_fill_streak", "0") or 0)
+        self._shutdown_email_sent = False
+        self._last_audit_signature = ""
+        self.ollama = OllamaClient(OLLAMA_URL, OLLAMA_MODEL, OLLAMA_MODEL_FAST, OLLAMA_TIMEOUT_SEC)
+        self._normalize_runtime_config()
+        self._ensure_reporting_baseline()
+        self.record_equity_snapshot(note="startup")
+
+    def _normalize_runtime_config(self):
+        cfg = self.cfg
+        p = cfg.params
+        f = cfg.filters
+        m = cfg.ml
+
+        p.max_positions = 4
+        p.max_coin_weight = 0.28
+        p.max_total_allocation = 0.82
+        p.risk_per_trade = 0.0085
+        p.atr_mult_stop = 2.0
+        p.max_stop_pct = 0.085
+        p.max_stop_pct_relaxed = 0.115
+        p.take_profit_pct = 0.022
+        p.trailing_start_pct = 0.010
+        p.trailing_atr_mult = 1.6
+        p.time_stop_hours = 5.0
+        p.exclude = sorted(normalize_excluded_symbols(getattr(p, "exclude", [])))
+
+        f.min_trade_value_ma_krw = 900_000.0
+        f.min_vol_ratio_hard = 0.05
+        f.min_vol_ratio_soft = 0.35
+        f.min_signal_score = 0.56
+        f.min_signal_score_relaxed = 0.50
+        f.stagnation_streak_to_relax = 16
+
+        m.hard_reject_below = 0.10
+        m.soft_floor = 0.33
+        m.min_validation_accuracy_for_hard_reject = 0.63
+        m.min_samples_for_hard_reject = 500
+
+        LOG.info(
+            "[CFG] runtime tuning 적용: max_stop_pct=%.3f, max_stop_pct_relaxed=%.3f, min_trade_value_ma_krw=%.1fK, min_vol_ratio_hard=%.2f, min_signal_score=%.2f, min_signal_score_relaxed=%.2f, ml.hard_reject_below=%.2f, exclude=%s"
+            % (
+                p.max_stop_pct,
+                p.max_stop_pct_relaxed,
+                f.min_trade_value_ma_krw / 1000.0,
+                f.min_vol_ratio_hard,
+                f.min_signal_score,
+                f.min_signal_score_relaxed,
+                m.hard_reject_below,
+                ",".join(sorted(p.exclude)),
+            )
+        )
+
+    def _ensure_reporting_baseline(self):
+        if self.db.get_meta("initial_capital_krw") is None:
+            self.db.set_meta("initial_capital_krw", str(float(INITIAL_CAPITAL_KRW)))
+        if self.db.get_meta("report_baseline_ts") is None:
+            self.db.set_meta("report_baseline_ts", str(now_ts()))
+
+    def excluded_symbols(self) -> set:
+        return normalize_excluded_symbols(getattr(self.cfg.params, "exclude", []))
+
+    def is_excluded_symbol(self, symbol: Any) -> bool:
+        return normalize_symbol(symbol) in self.excluded_symbols()
+
+    def is_excluded_market(self, market: Any) -> bool:
+        return market_is_excluded(market, self.excluded_symbols())
+
+    def _filter_positions_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or "market" not in df.columns:
+            return df
+        excluded = self.excluded_symbols()
+        mask = ~df["market"].astype(str).map(lambda m: market_is_excluded(m, excluded))
+        return df.loc[mask].copy()
+
+    def _filter_trades_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or "market" not in df.columns:
+            return df
+        excluded = self.excluded_symbols()
+        mask = ~df["market"].astype(str).map(lambda m: market_is_excluded(m, excluded))
+        return df.loc[mask].copy()
+
+    def _balance_asset_rows(self, min_value_krw: float = 3000.0) -> List[dict]:
+        balances = self.ex.get_balances()
+        rows: List[dict] = []
+        for cur, amt in balances.items():
+            symbol = normalize_symbol(cur)
+            amount = safe_float(amt, 0.0)
+            if symbol == "KRW" or amount <= 0 or self.is_excluded_symbol(symbol):
+                continue
+            price = safe_float(self.ex.get_price_krw(symbol), 0.0)
+            value = amount * price
+            if value < float(min_value_krw):
+                continue
+            rows.append({
+                "symbol": symbol,
+                "market": f"KRW-{symbol}",
+                "amount": amount,
+                "price": price,
+                "value_krw": value,
+            })
+        rows.sort(key=lambda x: x["value_krw"], reverse=True)
+        return rows
+
+    def get_unmanaged_live_holdings(self, min_value_krw: float = 3000.0) -> List[dict]:
+        live_rows = self._balance_asset_rows(min_value_krw=min_value_krw)
+        managed_df = self._filter_positions_df(self.db.get_positions())
+        managed_markets = set()
+        if managed_df is not None and not managed_df.empty:
+            managed_markets = {str(x).upper() for x in managed_df["market"].astype(str).tolist()}
+        return [row for row in live_rows if row["market"].upper() not in managed_markets]
+
+    def _current_stop_for_adopted_holding(self, market: str, price: float) -> float:
+        df = self.fetch_and_store_candles(market, self.cfg.params.candle_timeframe)
+        if df is not None and len(df) >= self.cfg.params.atr_period + 2:
+            try:
+                atrv = float(atr(df, self.cfg.params.atr_period).iloc[-1] or 0.0)
+            except Exception:
+                atrv = 0.0
+            if atrv > 0:
+                sl, _ = compute_stop_loss(price, atrv, self.cfg, relaxed=True)
+                if sl is not None:
+                    return float(sl)
+        fallback_pct = min(max(self.cfg.params.min_stop_pct * 4.0, 0.03), max(0.03, self.cfg.params.max_stop_pct_relaxed * 0.70))
+        return float(round_to_tick(price * (1.0 - fallback_pct)))
+
+    def sync_unmanaged_live_holdings(self):
+        if not isinstance(self.ex, LiveExchange):
+            return
+        if not getattr(self.cfg.params, "manage_unmanaged_live_holdings", True):
+            return
+
+        min_value_krw = float(getattr(self.cfg.params, "adopt_holdings_min_value_krw", self.cfg.params.min_order_krw) or self.cfg.params.min_order_krw)
+        managed_df = self._filter_positions_df(self.db.get_positions())
+        managed_markets = set()
+        if managed_df is not None and not managed_df.empty:
+            managed_markets = {str(x).upper() for x in managed_df["market"].astype(str).tolist()}
+
+        adopted_count = 0
+        exited_count = 0
+        for row in self.ex.get_account_rows():
+            symbol = normalize_symbol(row.get("currency"))
+            if not symbol or symbol == "KRW" or self.is_excluded_symbol(symbol):
+                continue
+
+            market = f"KRW-{symbol}"
+            if market.upper() in managed_markets:
+                continue
+
+            available = row.get("available", None)
+            if available is None:
+                amount = max(0.0, safe_float(row.get("balance"), 0.0) - safe_float(row.get("locked"), 0.0))
+            else:
+                amount = max(0.0, safe_float(available, 0.0))
+            if amount <= 0:
+                continue
+
+            price = safe_float(self.ex.get_price_krw(symbol), 0.0)
+            if price <= 0:
+                continue
+            value_krw = amount * price
+            if value_krw < min_value_krw:
+                continue
+
+            avg_buy = safe_float(row.get("avg_buy_price"), 0.0)
+            entry_price = avg_buy if avg_buy > 0 else price
+            pnl_pct = ((price - entry_price) / entry_price) if entry_price > 0 else 0.0
+
+            if getattr(self.cfg.params, "adopt_take_profit_immediate", True) and entry_price > 0 and pnl_pct >= self.cfg.params.take_profit_pct:
+                LOG.warning(
+                    f"[ADOPT_EXIT_TRY] {market} unmanaged holding immediate take_profit pnl_pct={pnl_pct:.2%} amount={amount:.8f} entry={format_price(entry_price)} price={format_price(price)}"
+                )
+                ok, oid, fee = self.ex.place_market_sell_all(market, amount)
+                if ok:
+                    self._close_position(market, entry_price, price, amount, fee, 0.0, "adopt_take_profit")
+                    exited_count += 1
+                else:
+                    LOG.warning(
+                        f"[SELL_FAIL] {market} adopt_take_profit pnl_pct={pnl_pct:.2%} size={amount:.8f}{self._order_chance_brief(market)}"
+                    )
+                continue
+
+            stop_loss = self._current_stop_for_adopted_holding(market, price)
+            self.db.upsert_position({
+                "market": market,
+                "entry_price": entry_price,
+                "entry_time": now_ts(),
+                "size": amount,
+                "stop_loss": stop_loss,
+                "direction": "long",
+                "entry_fee": 0.0,
+                "signal_type": "adopted_live_holding",
+                "score": 0.0,
+                "order_id": f"adopt-{uuid.uuid4()}",
+                "rsi_at_entry": 50.0,
+                "vol_ratio_at_entry": 1.0,
+                "tv_ma_at_entry": 0.0,
+                "ml_prob": None,
+            })
+            managed_markets.add(market.upper())
+            adopted_count += 1
+            LOG.warning(
+                f"[ADOPT] {market} unmanaged holding -> managed size={amount:.8f} entry={format_price(entry_price)} price={format_price(price)} pnl_pct={pnl_pct:.2%} sl={format_price(stop_loss)}"
+            )
+
+        if adopted_count or exited_count:
+            LOG.info(f"[SYNC] unmanaged holdings adopted={adopted_count} immediate_exits={exited_count}")
+
+    def _order_chance_brief(self, market: str) -> str:
+        if not isinstance(self.ex, LiveExchange) or self.private is None:
+            return ""
+        try:
+            chance = self.private.order_chance(market) or {}
+            ask = chance.get("ask_account") or {}
+            bid = chance.get("bid_account") or {}
+            ask_balance = ask.get("balance", "?")
+            ask_locked = ask.get("locked", "?")
+            bid_balance = bid.get("balance", "?")
+            return f" ask_balance={ask_balance} ask_locked={ask_locked} bid_balance={bid_balance}"
+        except Exception:
+            return ""
+
+    def log_position_audit(self):
+        managed_df = self._filter_positions_df(self.db.get_positions())
+        managed_count = 0 if managed_df.empty else len(managed_df)
+        unmanaged = self.get_unmanaged_live_holdings(min_value_krw=3000.0)
+        balances = self.ex.get_balances()
+        available_krw = safe_float(balances.get("KRW", 0.0), 0.0)
+        signature = json.dumps({
+            "managed_count": managed_count,
+            "available_krw": round(available_krw, 4),
+            "unmanaged": [(u["market"], round(u["value_krw"], 2)) for u in unmanaged[:8]],
+        }, ensure_ascii=False, sort_keys=True)
+        if signature != self._last_audit_signature:
+            self._last_audit_signature = signature
+            if unmanaged:
+                summary = [(u["market"], round(u["value_krw"])) for u in unmanaged[:8]]
+                LOG.warning(
+                    f"[AUDIT] managed_positions={managed_count} unmanaged_live_holdings={len(unmanaged)} available_krw={available_krw:,.0f} top={summary}"
+                )
+            else:
+                LOG.info(f"[AUDIT] managed_positions={managed_count} unmanaged_live_holdings=0 available_krw={available_krw:,.0f}")
+
+    def finalize_shutdown(self, reason: str = "ctrl_c"):
+        if self._shutdown_email_sent:
+            return
+        self._shutdown_email_sent = True
+        try:
+            self.record_equity_snapshot(note=f"shutdown:{reason}")
+        except Exception as e:
+            LOG.debug(f"[SHUTDOWN] 스냅샷 기록 실패(무시): {e}")
+        try:
+            sent = send_log_report_once(self.email_report, rotate_log=False, subject_suffix=f"shutdown:{reason}")
+            if sent:
+                LOG.info(f"[EMAIL] 종료 전 마지막 리포트 전송 완료 ({reason})")
+            else:
+                LOG.info(f"[EMAIL] 종료 전 마지막 리포트 전송 건너뜀 ({reason})")
+        except Exception as e:
+            LOG.error(f"[EMAIL] 종료 전 마지막 리포트 전송 실패: {e}")
+
+    # ---------- portfolio ----------
+    def get_equity_krw(self) -> float:
+        bal = self.ex.get_balances()
+        krw = float(bal.get("KRW", 0.0))
+        total = krw
+        for cur, amt in bal.items():
+            if cur == "KRW":
+                continue
+            if amt <= 0 or self.is_excluded_symbol(cur):
+                continue
+            p = self.ex.get_price_krw(cur)
+            if p:
+                total += amt * p
+        return float(total)
+
+    def get_allocated_krw(self) -> float:
+        pos = self._filter_positions_df(self.db.get_positions())
+        if pos.empty:
+            return 0.0
+        allocated = 0.0
+        for _, row in pos.iterrows():
+            allocated += float(row["entry_price"]) * float(row["size"])
+        return allocated
+
+    # ---------- universe ----------
+    def universe(self) -> List[str]:
+        data = self.public.ticker_all_krw()
+        if not data:
+            return []
+        excluded = self.excluded_symbols()
+        items = []
+        for sym, v in data.items():
+            if sym == "date":
+                continue
+            if normalize_symbol(sym) in excluded:
+                continue
+            try:
+                tv24 = float(v.get("acc_trade_value_24H", 0.0))
+                items.append((sym.upper(), tv24))
+            except Exception:
+                continue
+        items.sort(key=lambda x: x[1], reverse=True)
+        top = [f"KRW-{sym}" for sym, _ in items[: self.cfg.params.universe_size]]
+        return top
+
+    # ---------- data ingestion ----------
+    def fetch_and_store_candles(self, market: str, timeframe: str) -> Optional[pd.DataFrame]:
+        sym = market.split("-")[1]
+        raw = self.public.candlestick(sym, timeframe, "KRW")
+        # (symbol, interval, payment) already includes payment
+        if not raw:
+            return None
+        rows = []
+        for x in raw:
+            # expected: [timestamp, open, close, high, low, volume]
+            if not isinstance(x, (list, tuple)) or len(x) < 6:
+                continue
+            ts_ms = int(float(x[0]))
+            ts = ts_ms // 1000
+            o = float(x[1]); c = float(x[2]); h = float(x[3]); l = float(x[4]); v = float(x[5])
+            tv = c * v
+            rows.append((ts, market, timeframe, o, h, l, c, v, tv))
+        if not rows:
+            return None
+        self.db.put_candles(rows)
+        return self.db.get_candles(market, timeframe, limit=300)
+
+    # ---------- position management ----------
+    def maybe_exit_positions(self):
+        pos_df = self._filter_positions_df(self.db.get_positions())
+        if pos_df.empty:
+            return
+        now = now_ts()
+        live_balances = self.ex.get_balances() if isinstance(self.ex, LiveExchange) else {}
+        for _, pos in pos_df.iterrows():
+            market = str(pos["market"])
+            symbol = market.split("-")[1].upper()
+            price = self.ex.get_price_krw(symbol)
+            if not price:
+                LOG.warning(f"[EXIT_SKIP] {market} 현재가 조회 실패")
+                continue
+            entry = float(pos["entry_price"])
+            size = float(pos["size"])
+            sl = float(pos["stop_loss"])
+            entry_time = int(pos["entry_time"])
+            direction = pos.get("direction", "long")
+            sell_size = size
+
+            if isinstance(self.ex, LiveExchange):
+                have = float(live_balances.get(symbol, 0.0))
+                if have <= 0:
+                    LOG.warning(f"[POS_SYNC] {market} 잔고가 없어 포지션을 DB에서 정리합니다.")
+                    self.db.delete_position(market)
+                    continue
+                if have + 1e-12 < size:
+                    sell_size = have
+                    LOG.warning(f"[POS_SYNC] {market} size 보정 DB={size:.8f} -> balance={sell_size:.8f}")
+
+            holding_hours = (now - entry_time) / 3600.0
+            pnl_pct = (price - entry) / entry if direction == "long" else (entry - price) / entry
+
+            if direction == "long" and price <= sl:
+                LOG.info(f"[EXIT_TRY] {market} reason=stop_loss price={format_price(price)} sl={format_price(sl)} size={sell_size:.8f}")
+                ok, oid, fee = self.ex.place_market_sell_all(market, sell_size)
+                if ok:
+                    self._close_position(market, entry, price, sell_size, fee, holding_hours, "stop_loss")
+                else:
+                    LOG.warning(f"[SELL_FAIL] {market} stop_loss price={format_price(price)} sl={format_price(sl)} size={sell_size:.8f}{self._order_chance_brief(market)}")
+                continue
+
+            if pnl_pct >= self.cfg.params.take_profit_pct:
+                LOG.info(f"[EXIT_TRY] {market} reason=take_profit pnl_pct={pnl_pct:.2%} threshold={self.cfg.params.take_profit_pct:.2%} size={sell_size:.8f}")
+                ok, oid, fee = self.ex.place_market_sell_all(market, sell_size)
+                if ok:
+                    self._close_position(market, entry, price, sell_size, fee, holding_hours, "take_profit")
+                else:
+                    LOG.warning(f"[SELL_FAIL] {market} take_profit pnl_pct={pnl_pct:.2%} size={sell_size:.8f}{self._order_chance_brief(market)}")
+                continue
+
+            if holding_hours >= self.cfg.params.time_stop_hours:
+                LOG.info(f"[EXIT_TRY] {market} reason=time_stop holding_hours={holding_hours:.2f} limit={self.cfg.params.time_stop_hours:.2f} size={sell_size:.8f}")
+                ok, oid, fee = self.ex.place_market_sell_all(market, sell_size)
+                if ok:
+                    self._close_position(market, entry, price, sell_size, fee, holding_hours, "time_stop")
+                else:
+                    LOG.warning(f"[SELL_FAIL] {market} time_stop holding_hours={holding_hours:.2f} size={sell_size:.8f}{self._order_chance_brief(market)}")
+                continue
+
+            if pnl_pct >= self.cfg.params.trailing_start_pct:
+                df = self.db.get_candles(market, self.cfg.params.candle_timeframe, limit=120)
+                if len(df) >= self.cfg.params.atr_period + 2:
+                    a = atr(df, self.cfg.params.atr_period)
+                    atrv = float(a.iloc[-1] or 0.0)
+                    if atrv > 0:
+                        new_sl = round_to_tick(price - atrv * self.cfg.params.trailing_atr_mult)
+                        if new_sl > sl:
+                            self.db.upsert_position({
+                                "market": market,
+                                "entry_price": entry,
+                                "entry_time": entry_time,
+                                "size": size,
+                                "stop_loss": new_sl,
+                                "direction": direction,
+                                "entry_fee": float(pos.get("entry_fee", 0.0)),
+                                "signal_type": pos.get("signal_type", "unknown"),
+                                "score": float(pos.get("score", 0.0)),
+                                "order_id": pos.get("order_id", ""),
+                                "rsi_at_entry": float(pos.get("rsi_at_entry", 50.0)),
+                                "vol_ratio_at_entry": float(pos.get("vol_ratio_at_entry", 1.0)),
+                                "tv_ma_at_entry": float(pos.get("tv_ma_at_entry", 0.0)),
+                                "ml_prob": pos.get("ml_prob", None),
+                            })
+                            LOG.info(f"[TRAIL] {market} SL {format_price(sl)} → {format_price(new_sl)}")
+
+    def _close_position(self, market: str, entry: float, exit_p: float, size: float, exit_fee: float, holding_hours: float, reason: str):
+        # compute total fee approximately: entry fee is stored in position table
+        pos_df = self.db.get_positions()
+        entry_fee = 0.0
+        rsi_at_entry = 50.0
+        vol_ratio_at_entry = 1.0
+        tv_ma_at_entry = 0.0
+        ml_prob = None
+        if not pos_df.empty:
+            r = pos_df[pos_df["market"] == market]
+            if not r.empty:
+                entry_fee = float(r.iloc[0].get("entry_fee", 0.0) or 0.0)
+                sig_type = r.iloc[0].get("signal_type", "unknown")
+                score = float(r.iloc[0].get("score", 0.0) or 0.0)
+                rsi_at_entry = float(r.iloc[0].get("rsi_at_entry", 50.0) or 50.0)
+                vol_ratio_at_entry = float(r.iloc[0].get("vol_ratio_at_entry", 1.0) or 1.0)
+                tv_ma_at_entry = float(r.iloc[0].get("tv_ma_at_entry", 0.0) or 0.0)
+                ml_prob = r.iloc[0].get("ml_prob", None)
+            else:
+                sig_type = "unknown"
+                score = 0.0
+        else:
+            sig_type = "unknown"
+            score = 0.0
+
+        pnl = (exit_p - entry) * size
+        total_fee = float(entry_fee) + float(exit_fee)
+        pnl_net = pnl - total_fee
+
+        t = {
+            "market": market,
+            "direction": "long",
+            "entry_price": entry,
+            "exit_price": exit_p,
+            "size": size,
+            "entry_time": int(now_ts() - holding_hours * 3600),
+            "exit_time": now_ts(),
+            "pnl": pnl_net,
+            "total_fee": total_fee,
+            "holding_hours": holding_hours,
+            "exit_reason": reason,
+            "signal_type": sig_type,
+            "score": score,
+            "rsi_at_entry": rsi_at_entry,
+            "vol_ratio_at_entry": vol_ratio_at_entry,
+            "tv_ma_at_entry": tv_ma_at_entry,
+            "ml_prob": ml_prob,
+        }
+        self.db.insert_trade(t)
+        self.db.delete_position(market)
+        LOG.info(f"[EXIT] {market} reason={reason} pnl={pnl_net:,.0f}krw (gross={pnl:,.0f}, fee={total_fee:,.0f})")
+
+        # per-coin cooldown on loss
+        if pnl_net <= 0:
+            set_block_until(self.db, market, seconds=60*30, reason="loss_cooldown")
+
+    # ---------- entry ----------
+    def decide_and_enter(self):
+        cfg = self.cfg
+        equity = self.get_equity_krw()
+        balances = self.ex.get_balances()
+        krw = float(balances.get("KRW", 0.0))
+
+        pos_df = self._filter_positions_df(self.db.get_positions())
+        open_n = 0 if pos_df.empty else len(pos_df)
+        if open_n >= cfg.params.max_positions:
+            return
+
+        allocated = self.get_allocated_krw()
+        if equity > 0 and allocated / equity >= cfg.params.max_total_allocation:
+            return
+
+        trades = self._filter_trades_df(self.db.recent_trades(limit=200))
+        losses10, n10 = compute_loss_stats(trades)
+        defensive = (n10 >= 8 and losses10 >= cfg.filters.defensive_loss_trigger)
+        relaxed = (self.no_fill_streak >= cfg.filters.stagnation_streak_to_relax)
+
+        min_score = cfg.filters.min_signal_score_relaxed if relaxed else cfg.filters.min_signal_score
+        if self.no_fill_streak >= 40:
+            min_score -= 0.02
+        if self.no_fill_streak >= 80:
+            min_score -= 0.04
+        if self.no_fill_streak >= 120:
+            min_score -= 0.04
+        min_score = max(0.44, min_score)
+
+        risk_mult = 0.5 if defensive else 1.0
+        if relaxed:
+            risk_mult *= 0.6
+
+        stop_cap = cfg.params.max_stop_pct_relaxed if relaxed else cfg.params.max_stop_pct
+        ml_meta = get_ml_model_meta(self.db)
+        ml_hard_reject_enabled = (
+            cfg.ml.enabled
+            and ml_meta.get("n", 0) >= getattr(cfg.ml, "min_samples_for_hard_reject", 600)
+            and ml_meta.get("val_acc", 0.0) >= getattr(cfg.ml, "min_validation_accuracy_for_hard_reject", 0.64)
+        )
+
+        markets = self.universe()
+        candidates: List[Signal] = []
+
+        for market in markets:
+            blocked, remain = is_blocked(self.db, market)
+            if blocked:
+                continue
+            if not pos_df.empty and (pos_df["market"] == market).any():
+                continue
+
+            df = self.fetch_and_store_candles(market, cfg.params.candle_timeframe)
+            if df is None or df.empty:
+                self.gate_reject_counter["no_candles"] += 1
+                continue
+
+            vr = latest_vol_ratio(df, 20)
+            tv = trade_value_ma(df, 20)
+            liquidity_penalty = 0.0
+
+            if tv < cfg.filters.min_trade_value_ma_krw:
+                if tv < cfg.filters.min_trade_value_ma_krw * 0.35:
+                    self.gate_reject_counter["hard_block: low_trade_value"] += 1
+                    continue
+                liquidity_penalty += 0.10
+
+            if vr < cfg.filters.min_vol_ratio_hard:
+                if vr < max(0.010, cfg.filters.min_vol_ratio_hard * 0.35):
+                    self.gate_reject_counter["hard_block: low_volume"] += 1
+                    continue
+                liquidity_penalty += 0.06
+
+            res = score_signal(df, cfg)
+            if not res:
+                self.hold_counter["no_signal"] += 1
+                continue
+            signal_type, score, meta = res
+
+            if liquidity_penalty > 0:
+                score = max(0.0, score - liquidity_penalty)
+                meta["liquidity_penalty"] = liquidity_penalty
+
+            symbol = market.split("-")[1].upper()
+            if self.is_excluded_symbol(symbol):
+                continue
+            price = self.ex.get_price_krw(symbol)
+            if not price:
+                continue
+            price = float(price)
+
+            clamp_wide_stop = relaxed or self.no_fill_streak >= 100
+            sl, sl_reason = compute_stop_loss(
+                price,
+                meta.get("atr", 0.0),
+                cfg,
+                relaxed=(relaxed or self.no_fill_streak >= 60),
+                max_stop_pct_override=stop_cap,
+                clamp_when_wide=clamp_wide_stop,
+            )
+            if sl is None:
+                self.hold_counter[sl_reason] += 1
+                continue
+            if sl_reason.startswith("stop_clamped"):
+                meta["stop_clamped"] = sl_reason
+                score *= 0.97
+
+            tp = round_to_tick(price * (1 + cfg.params.take_profit_pct))
+
+            ml_prob = 0.5
+            if cfg.ml.enabled:
+                ml_prob = predict_ml_prob(
+                    self.db,
+                    signal_type,
+                    score,
+                    float(meta.get("rsiv", 50.0)),
+                    float(meta.get("vr", 1.0)),
+                    float(meta.get("tv_ma", 0.0)),
+                )
+                if ml_hard_reject_enabled and ml_prob < cfg.ml.hard_reject_below:
+                    self.gate_reject_counter["ML_hard_reject"] += 1
+                    continue
+                if ml_prob < cfg.ml.soft_floor:
+                    score *= 0.90
+
+            if score < min_score:
+                self.gate_reject_counter["score_below_min"] += 1
+                continue
+
+            candidates.append(Signal(
+                market=market,
+                symbol=symbol,
+                price=price,
+                signal_type=signal_type,
+                score=score,
+                rsi=float(meta.get("rsiv", 50.0)),
+                vol_ratio=float(meta.get("vr", 1.0)),
+                tv_ma=float(meta.get("tv_ma", 0.0)),
+                stop_loss=float(sl),
+                take_profit=float(tp),
+                meta={"ml_prob": ml_prob, **meta},
+            ))
+
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda s: (s.score, s.meta.get("ml_prob", 0.5), s.tv_ma), reverse=True)
+        chosen = candidates[0]
+
+        stop_dist = max(1e-9, chosen.price - chosen.stop_loss)
+        risk_budget = equity * cfg.params.risk_per_trade * risk_mult
+        raw_size = risk_budget / stop_dist
+
+        max_pos_krw = equity * cfg.params.max_coin_weight
+        size_by_alloc = max_pos_krw / chosen.price
+        size = min(raw_size, size_by_alloc)
+
+        order_krw = size * chosen.price
+        if order_krw < cfg.params.min_order_krw:
+            need = cfg.params.min_order_krw / chosen.price
+            size = min(size_by_alloc, max(size, need))
+            order_krw = size * chosen.price
+
+        cash_cap = krw * (1.0 if relaxed else 0.95)
+        if order_krw > cash_cap:
+            size = cash_cap / chosen.price
+            order_krw = size * chosen.price
+
+        order_krw = float(normalize_krw_amount(order_krw))
+        if isinstance(self.ex, LiveExchange):
+            live_cash_cap = normalize_krw_amount(krw * (1.0 - cfg.params.fee_rate - 0.002))
+            order_krw = float(min(order_krw, live_cash_cap))
+            size = order_krw / chosen.price if chosen.price > 0 else 0.0
+
+        if order_krw < cfg.params.min_order_krw or size <= 0:
+            self.gate_reject_counter["insufficient_krw"] += 1
+            LOG.info(f"[ORDER_SKIP] insufficient_krw usable={krw:,.0f} order={order_krw:,.0f} equity={equity:,.0f} excluded={sorted(self.excluded_symbols())}")
+            return
+
+        pre_balances = self.ex.get_balances() if isinstance(self.ex, LiveExchange) else balances
+        pre_asset = float(pre_balances.get(chosen.symbol.upper(), 0.0))
+        ok, oid, fee = self.ex.place_market_buy_krw(chosen.market, float(order_krw))
+        if not ok:
+            self.gate_reject_counter["buy_failed"] += 1
+            return
+
+        filled_size = size
+        if isinstance(self.ex, LiveExchange):
+            time.sleep(0.35)
+            post_balances = self.ex.get_balances()
+            post_asset = float(post_balances.get(chosen.symbol.upper(), pre_asset))
+            delta = max(0.0, post_asset - pre_asset)
+            if delta > 0:
+                filled_size = delta
+            else:
+                LOG.warning(f"[ENTRY_SYNC] {chosen.market} 체결수량 동기화 실패, 계산수량 사용")
+
+        self.db.upsert_position({
+            "market": chosen.market,
+            "entry_price": chosen.price,
+            "entry_time": now_ts(),
+            "size": filled_size,
+            "stop_loss": chosen.stop_loss,
+            "direction": "long",
+            "entry_fee": fee,
+            "signal_type": chosen.signal_type,
+            "score": chosen.score,
+            "order_id": oid,
+            "rsi_at_entry": chosen.rsi,
+            "vol_ratio_at_entry": chosen.vol_ratio,
+            "tv_ma_at_entry": chosen.tv_ma,
+            "ml_prob": chosen.meta.get("ml_prob", 0.5),
+        })
+        LOG.info(
+            f"[ENTER] {chosen.market} type={chosen.signal_type} score={chosen.score:.2f} "
+            f"ml={chosen.meta.get('ml_prob',0.5):.2f} entry={format_price(chosen.price)} "
+            f"sl={format_price(chosen.stop_loss)} stop_cap={stop_cap:.1%} size={filled_size:.6f} cost≈{order_krw:,.0f}krw"
+        )
+
+        self.no_fill_streak = 0
+        self.db.set_meta("no_fill_streak", str(self.no_fill_streak))
+
+    def record_equity_snapshot(self, note: str = "cycle") -> dict:
+        equity = self.get_equity_krw()
+        balances = self.ex.get_balances()
+        available_krw = safe_float(balances.get("KRW", 0.0), 0.0)
+        positions_df = self._filter_positions_df(self.db.get_positions())
+        position_count = 0 if positions_df.empty else int(len(positions_df))
+        ts = now_ts()
+        self.db.insert_equity_snapshot(ts, equity, available_krw, position_count, note)
+        return {
+            "ts": ts,
+            "equity_krw": float(equity),
+            "available_krw": float(available_krw),
+            "position_count": int(position_count),
+            "note": note,
         }
 
-        resp = requests.post(
-            CFG.ollama_url,
-            json=payload,
-            timeout=180
-        )
-        raw_resp = resp.json()
-        logger.debug(f"[AI Market Analyst] Raw response: {raw_resp}")
+    def equity_change_report(self, current_equity: Optional[float] = None) -> dict:
+        equity = float(current_equity if current_equity is not None else self.get_equity_krw())
+        initial_capital = safe_float(self.db.get_meta("initial_capital_krw", str(INITIAL_CAPITAL_KRW)), INITIAL_CAPITAL_KRW)
+        snap_3h = self.db.get_last_equity_snapshot_before(now_ts() - 3 * 3600)
+        equity_3h = safe_float((snap_3h or {}).get("equity_krw"), equity)
+        change_3h = equity - equity_3h
+        change_initial = equity - initial_capital
+        pct_3h = (change_3h / equity_3h) if equity_3h > 0 else 0.0
+        pct_initial = (change_initial / initial_capital) if initial_capital > 0 else 0.0
+        return {
+            "current_equity": equity,
+            "initial_capital": initial_capital,
+            "equity_3h_ago": equity_3h,
+            "change_3h": change_3h,
+            "change_3h_pct": pct_3h,
+            "change_initial": change_initial,
+            "change_initial_pct": pct_initial,
+            "snapshot_3h": snap_3h,
+        }
 
-        # ==================== 응답 파싱 (더 강력하게) ====================
-        content = ""
+    def maybe_generate_ai_email_summary(self, perf: dict, eq: dict) -> Optional[str]:
+        if not OLLAMA_EMAIL_SUMMARY:
+            return None
+        prompt = {
+            "equity": round(eq.get("current_equity", 0.0), 2),
+            "change_3h": round(eq.get("change_3h", 0.0), 2),
+            "change_3h_pct": round(eq.get("change_3h_pct", 0.0) * 100, 4),
+            "change_initial": round(eq.get("change_initial", 0.0), 2),
+            "change_initial_pct": round(eq.get("change_initial_pct", 0.0) * 100, 4),
+            "win_rate": round(perf.get("win_rate", 0.0) * 100, 2),
+            "recent_win_rate": round(perf.get("recent_win_rate", 0.0) * 100, 2),
+            "no_fill_streak": self.no_fill_streak,
+            "hold_top": self.hold_counter.most_common(5),
+            "gate_reject_top": self.gate_reject_counter.most_common(5),
+        }
+        messages = [
+            {"role": "system", "content": "너는 자동매매 봇 운영 리포터다. 한국어로만 답하고, 3줄 이내로 핵심 진단만 작성한다. 과장 없이 수치 기반으로 적는다."},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ]
+        return self.ollama.chat(messages, fast=True)
 
-        # 1. chat 엔드포인트 형식
-        if "message" in raw_resp and isinstance(raw_resp["message"], dict):
-            content = raw_resp["message"].get("content", "")
-
-        # 2. generate 엔드포인트 형식 (만약 나중에 바꿀 경우 대비)
-        elif "response" in raw_resp:
-            content = raw_resp.get("response", "")
-
-        # 3. 직접 content 키가 있는 경우
-        elif "content" in raw_resp:
-            content = raw_resp["content"]
-
-        content = content.strip()
-
-        if not content:
-            logger.error(f"[AI Market Analyst] 응답 비어있음 — Raw: {raw_resp}")
-            return "Unknown Regime (Empty response)"
-
-        # 코드블록 제거
-        content = re.sub(r"```json|```", "", content).strip()
-
-        # JSON 파싱
-        try:
-            parsed = json.loads(content)
-            regime = parsed.get("regime", "Unknown")
-            reason = parsed.get("reason", "No reason provided")
-            result = f"Regime: {regime} | Reason: {reason}"
-            logger.info(f"[AI Market Analyst] {result}")
-            return result
-
-        except json.JSONDecodeError as e:
-            logger.error(f"[AI Market Analyst] JSON 파싱 실패: {e}")
-            logger.error(f"Raw content: {content}")
-            return "Unknown Regime (Invalid JSON)"
-
-    except requests.exceptions.Timeout:
-        logger.error("[AI Market Analyst] Ollama 요청 타임아웃")
-        return "Unknown Regime (Timeout)"
-    except Exception as e:
-        logger.error(f"[AI Market Analyst] 분석 실패: {e}", exc_info=True)
-        return "Unknown Regime (Error occurred)"
-
-# ============================================================
-# [2단계] 전략 사령관 (The Strategist)
-# ============================================================
-def ai_refresh_all_configs(ai_cfg: AIConfig, perf: dict, run_strategy: bool = True) -> tuple:
-    """
-    [2단계: 전략 사령관]
-    시장 분석가의 리포트를 바탕으로 AI 설정을 통합 업데이트합니다.
-    """
-    # 전역 변수 참조
-    global HOLD_REASON_COUNTS, GATE_REJECT_REASON_COUNTS
-
-    if not CFG.ollama_url or not CFG.ollama_model:
-        logger.warning("[AI] Ollama not configured — skipping config update")
-        return ai_cfg, "(Ollama not configured)"
-
-    # 1. 시장 분석가 호출
-    market_context = ai_analyze_market_regime()
-    logger.info(f"[AI] 1단계 시장 분석 완료: {market_context}")
-    
-    if not run_strategy:
-        logger.info("[AI] 2단계(전략 업데이트) 스킵 — 다음 strategy 갱신까지 현재 Config 유지")
-        return ai_cfg, f"(1단계만 실행) Market: {market_context}"
-    
-    # [추가] 필터링 통계 생성
-    hold_top = HOLD_REASON_COUNTS.most_common(8)
-    hold_stats_str = "\n".join([f"  - {r}: {c} times" for r, c in hold_top]) if hold_top else "  - (No data)"
-    gate_top = GATE_REJECT_REASON_COUNTS.most_common(5)
-    gate_stats_str = "\n".join([f"  - {r}: {c} times" for r, c in gate_top]) if gate_top else "  - (No data)"
-
-    current_json = json.dumps(ai_cfg.to_dict(), ensure_ascii=False, indent=2)
-
-    prompt = f"""
-    You are an AI cryptocurrency trading strategy commander.
-    You trade on Bithumb using 30-minute candles.
-
-    ## Current Market Context
-    {market_context}
-
-    ## Performance
-    - Total Trades: {perf.get("total_trades", 0)}
-    - Win Rate: {perf.get("win_rate", 0)*100:.1f}%
-
-    ## ★ Signal Filter Stats (Why coins are REJECTED)
-    ### HOLD Reasons (Blocked by Signal Config):
-    {hold_stats_str}
-
-    ### Gatekeeper Rejects:
-    {gate_stats_str}
-
-    ## CRITICAL INSTRUCTIONS:
-    1. If 'price_too_high' count is high (>300): INCREASE signal.price_pos_max (up to 0.90).
-    2. If 'low_volume' count is high (>200): DECREASE signal.volume_confirm_mult (down to 0.5).
-    3. If 'downtrend' count is high: Consider setting strategy.use_trend_filter=false.
-    4. If 'no_signal_streak' is extremely high, aggressively relax ALL filters.
-
-    ## Current Config
-    {current_json}
-
-    Respond ONLY in JSON format:
-    {{
-    "params": {{ ... }},
-    "strategy": {{ ... }},
-    "signal": {{ ... }},
-    "risk": {{ ... }},
-    "changes_summary": "English summary of what you changed and WHY"
-    }}
-    """
-    
-    try:
-        resp = requests.post(CFG.ollama_url, json={
-            "model": CFG.ollama_model,
-            "messages": [
-                {"role": "system", "content": "You are a Chief Trading Strategist. You ALWAYS respond with pure, valid JSON only. No extra text, no markdown, no explanations outside the JSON structure."},
-                {"role": "user",   "content": prompt}
-            ],
-            "stream": False,
-            # "format": "json",   ←←← 주석 처리 또는 완전 삭제
-            "options": {
-                "temperature": 0.25,   # 조금 더 낮춰서 형식 준수율 ↑
-                "num_predict": 1800,
-                "num_ctx": 8192        # 충분히 넉넉하게 (필요 시 조정)
+    # ---------- reporting ----------
+    def performance_summary(self) -> dict:
+        trades = self._filter_trades_df(self.db.recent_trades(limit=200))
+        if trades.empty:
+            return {
+                "total_trades": 0,
+                "win_rate": 0.0,
+                "recent20_win_rate": 0.0,
+                "recent_win_rate": 0.0,
+                "total_pnl": 0.0,
+                "recent20_pnl": 0.0,
+                "best": 0.0,
+                "worst": 0.0,
             }
-        }, timeout=300)
+        pnl = pd.to_numeric(trades["pnl"], errors="coerce").fillna(0.0)
+        wins = int((pnl > 0).sum())
+        total = int(len(trades))
+        recent20 = pnl.tail(20)
+        recent20_wins = int((recent20 > 0).sum())
+        return {
+            "total_trades": total,
+            "win_rate": wins / total if total else 0.0,
+            "recent20_win_rate": recent20_wins / len(recent20) if len(recent20) else 0.0,
+            "recent_win_rate": recent20_wins / len(recent20) if len(recent20) else 0.0,
+            "total_pnl": float(pnl.sum()),
+            "recent20_pnl": float(recent20.sum()) if len(recent20) else 0.0,
+            "best": float(pnl.max()),
+            "worst": float(pnl.min()),
+        }
 
-        raw_resp = resp.json()
-        if "error" in raw_resp:
-            logger.error(f"[AI Strategist] Ollama error: {raw_resp['error']}")
-            return ai_cfg, f"(Ollama error: {raw_resp['error']})"
+    def email_report(self) -> Tuple[str, str]:
+        snap = self.record_equity_snapshot(note="email")
+        equity = float(snap["equity_krw"])
+        perf = self.performance_summary()
+        eq = self.equity_change_report(equity)
+        positions_df = self._filter_positions_df(self.db.get_positions())
+        positions = positions_df.to_dict("records") if not positions_df.empty else []
+        unmanaged = self.get_unmanaged_live_holdings(min_value_krw=3000.0)
+        balances = self.ex.get_balances()
+        available_krw = safe_float(balances.get("KRW", 0.0), 0.0)
+        ai_summary = self.maybe_generate_ai_email_summary(perf, eq)
 
-        # 응답 파싱 강화
-        content = ""
-        if "message" in raw_resp and isinstance(raw_resp["message"], dict):
-            content = raw_resp["message"].get("content", "").strip()
-        elif "response" in raw_resp:
-            content = raw_resp.get("response", "").strip()
+        subject = (
+            f"[BOT] 총액 {equity:,.0f} KRW | 3h {format_signed_krw(eq['change_3h'])} ({format_signed_pct(eq['change_3h_pct'])}) "
+            f"| 초기 {format_signed_krw(eq['change_initial'])} ({format_signed_pct(eq['change_initial_pct'])}) "
+            f"| 승률 {perf.get('win_rate', 0.0) * 100:.1f}%"
+        )
 
-        if not content:
-            logger.error(f"[AI Strategist] Empty content — raw: {raw_resp}")
-            return ai_cfg, "(Empty response from Ollama)"
+        lines = [
+            f"리포트 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "[핵심 지표]",
+            f"- 총액: {equity:,.0f} KRW",
+            f"- 3시간 전 대비: {format_signed_krw(eq['change_3h'])} ({format_signed_pct(eq['change_3h_pct'])}) | 기준 총액 {eq['equity_3h_ago']:,.0f} KRW",
+            f"- 초기 금액 200,000 대비: {format_signed_krw(eq['change_initial'])} ({format_signed_pct(eq['change_initial_pct'])})",
+            f"- 승률: 전체 {perf.get('win_rate', 0.0) * 100:.2f}% | 최근 20건 {perf.get('recent20_win_rate', 0.0) * 100:.2f}%",
+            f"- 누적 손익: {format_signed_krw(perf.get('total_pnl', 0.0))}",
+            f"- 최근 20건 손익: {format_signed_krw(perf.get('recent20_pnl', 0.0))}",
+            f"- 거래 수: 총 {perf.get('total_trades', 0)}건",
+            f"- no_fill_streak: {self.no_fill_streak}",
+            f"- 사용 가능 KRW: {available_krw:,.0f}",
+            f"- 제외 자산: {', '.join(sorted(self.excluded_symbols()))}",
+            "",
+            "[병목 요약]",
+            f"- HOLD 상위: {self.hold_counter.most_common(8)}",
+            f"- GATE reject 상위: {self.gate_reject_counter.most_common(8)}",
+            "",
+            "[보유 포지션]",
+        ]
 
-        # ```json ... ``` 제거 방어
-        content = re.sub(r'^```json\s*|\s*```$', '', content.strip())
-
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.error(f"[AI Strategist] JSON parse failed: {e}\nContent was: {content}")
-            return ai_cfg, "(Invalid JSON format returned)"
-
-        summary = parsed.pop("changes_summary", "(No changes)")
-        
-        new_cfg = AIConfig.from_dict(parsed)
-        new_cfg = validate_and_clamp_config(new_cfg)
-        new_cfg.save_to_db()
-        save_ai_change_summary(summary)
-        
-        logger.info(f"[AI Strategist] Updated: {summary[:100]}...")
-        return new_cfg, summary
-
-    except Exception as e:
-        logger.error(f"[AI Strategist] Exception: {e}", exc_info=True)
-        return ai_cfg, f"(Error: {e})"
-
-# ============================================================
-# [3단계] 매수 검문관 (The Gatekeeper)
-# ============================================================
-def ai_verify_buy_signal(market: str, current_price: float, df: pd.DataFrame, signal_reason: str) -> dict:
-    """
-    [3단계: 매수 검문관]
-    발생한 매수 신호가 하락장 속 속임수(Fakeout)인지, 진짜 진입 기회인지 최종 승인합니다.
-    """
-    if not CFG.ollama_url or not CFG.ollama_model_fast:
-        return {"decision": "APPROVE", "reason": "AI Not Configured - Auto Approve"}
-        
-    try:
-        # 최근 15개 캔들의 흐름을 문자열로 변환
-        recent_candles = df.tail(15)
-        chart_text = ""
-        for i, row in recent_candles.iterrows():
-            change = (row['close'] - row['open']) / row['open'] * 100
-            # 거래량 대비 이동평균선(20) 비율
-            vol_ratio = row['volume'] / row['volume_ma'] if pd.notna(row['volume_ma']) and row['volume_ma'] > 0 else 1.0
-            chart_text += f"- Close: {row['close']:,.0f} | Change: {change:+.2f}% | VolRatio: {vol_ratio:.1f}x | RSI: {row['rsi']:.1f}\n"
-
-        if signal_reason == "pullback_ema20":
-            strategy_context = """
-        Signal Type: EMA20 PULLBACK
-        This signal fires when price dips close to the 20-period EMA and bounces.
-
-        APPROVE only if ALL of the following are true:
-        1. Price has touched or dipped below EMA20 within the last 3 candles, then rebounded
-        2. RSI is between 35~60 (not overbought, recovering from mild dip)
-        3. Current candle closes above EMA20
-        4. Volume on the bounce candle is >= 0.8x the 20-candle average
-
-        REJECT if ANY of the following are true:
-        1. RSI is above 65 (already extended, poor risk/reward)
-        2. Price closed below EMA20 and has not recovered (failed pullback)
-        3. 3 or more consecutive red candles with no sign of reversal
-        4. Volume on the last candle is below 0.6x average (no buyer conviction)
-        """
-
-        elif signal_reason == "volatility_breakout":
-            strategy_context = """
-        Signal Type: VOLATILITY BREAKOUT (BB Upper Band)
-        This signal fires when price breaks above the upper Bollinger Band with volume surge.
-
-        APPROVE only if ALL of the following are true:
-        1. Breakout candle has volume >= 1.5x the 20-candle average
-        2. The candle body is bullish (close > open), not a wick-only breakout
-        3. RSI is between 50~75 (momentum zone, not yet overextended)
-        4. Price has not already extended more than 3% above BB upper band
-
-        REJECT if ANY of the following are true:
-        1. Volume is below 1.2x average (weak breakout, likely fakeout)
-        2. RSI is above 78 (overextended, high reversal risk)
-        3. The breakout candle is mostly upper wick with small body (exhaustion sign)
-        4. Previous 2 candles were also breakout-level (chasing extended move)
-        """
-
-        elif signal_reason == "rsi_oversold_bounce":
-            strategy_context = """
-        Signal Type: RSI OVERSOLD BOUNCE
-        This signal fires when RSI recovers upward from below 35.
-
-        APPROVE only if ALL of the following are true:
-        1. RSI was below 35 in the previous candle and is now rising
-        2. Current candle is bullish (green candle, close > open)
-        3. Price is within 6% of the 60-period EMA (not a free-fall collapse)
-        4. Volume is >= 0.8x average (some buying interest returning)
-
-        REJECT if ANY of the following are true:
-        1. RSI is still falling (no confirmed reversal yet)
-        2. Price is more than 8% below EMA60 (structural breakdown, not a bounce)
-        3. 2 or more consecutive large red candles (>1.5% body each) still ongoing
-        4. Volume is below 0.5x average (no buyers, dead cat scenario)
-        """
-
+        if positions:
+            for p in positions:
+                lines.append(
+                    f"- {p.get('market')} | 진입가 {format_price(safe_float(p.get('entry_price')))} | "
+                    f"손절 {format_price(safe_float(p.get('stop_loss')))} | size {safe_float(p.get('size')):.8f} | "
+                    f"score {safe_float(p.get('score')):.2f} | ml {safe_float(p.get('ml_prob'), 0.5):.2f}"
+                )
         else:
-            strategy_context = """
-        Signal Type: GENERAL
-        APPROVE only if price shows clear signs of stabilization with volume support.
-        REJECT if trend is clearly downward or volume is absent.
-        """
+            lines.append("- 없음")
 
-        # 해당 종목 최근 거래 성과 요약
-        recent = db_get_recent_trades_by_market(market, limit=10)
-        if not recent.empty:
-            wins   = int((recent['pnl'] > 0).sum())
-            losses = int((recent['pnl'] <= 0).sum())
-            avg_pnl = float(recent['pnl'].mean())
-            last_exit = recent.iloc[0]['exit_reason']
-            consec = get_consecutive_losses_by_market(market)
-
-            performance_context = f"""
-        Past Performance for {market} (last {len(recent)} trades):
-        - Win/Loss: {wins}W / {losses}L  (win rate: {wins/len(recent)*100:.0f}%)
-        - Avg PnL: {avg_pnl:+.0f} KRW
-        - Last exit reason: {last_exit}
-        - Current consecutive losses: {consec}
-        """
+        lines += ["", "[비관리 보유자산]"]
+        if unmanaged:
+            for row in unmanaged:
+                lines.append(
+                    f"- {row['market']} | 수량 {safe_float(row.get('amount')):.8f} | 현재가 {format_price(safe_float(row.get('price')))} | 평가액 {safe_float(row.get('value_krw')):,.0f} KRW"
+                )
         else:
-            performance_context = f"Past Performance for {market}: No trade history yet.\n"
+            lines.append("- 없음")
 
-        prompt = f"""
-        You are a strict momentum trading signal validator for a short-term scalping bot on Bithumb.
-        The bot targets +1~1.5% profit per trade within 1-2 hours.
-        A BUY signal was triggered for {market}.
+        if ai_summary:
+            lines += ["", "[AI 요약]", ai_summary]
 
-        {strategy_context}
+        lines += [
+            "",
+            "[JSON]",
+            json.dumps({
+                "time": datetime.now().isoformat(),
+                "equity_krw": equity,
+                "equity_change": eq,
+                "perf": perf,
+                "no_fill_streak": self.no_fill_streak,
+                "hold_top": self.hold_counter.most_common(8),
+                "gate_reject_top": self.gate_reject_counter.most_common(8),
+                "positions": positions,
+                "unmanaged_live_holdings": unmanaged,
+                "available_krw": available_krw,
+                "ai_summary": ai_summary,
+            }, ensure_ascii=False, indent=2),
+        ]
+        body = "\n".join(lines)
+        return subject, body
 
-        Current Price: {current_price:,.0f} KRW
+    def cycle(self):
+        LOG.info("="*60)
+        LOG.info(f"[CYCLE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        LOG.info("="*60)
 
-        Recent 15 Candles (oldest → newest):
-        {chart_text}
+        if self.cfg.ml.enabled:
+            last_train = float(self.db.get_meta("ml_last_train", "0") or 0)
+            if time.time() - last_train > 2 * 3600:
+                train_ml_model(self.db, self.cfg.ml.min_trades_to_train)
+                self.db.set_meta("ml_last_train", str(time.time()))
 
-        Instructions:
-        - You are a BALANCED validator. Approximately 40% of signals should be APPROVED if conditions are reasonable.
-        - Only REJECT if you find a clear, specific failing condition. Do NOT reject on ambiguity alone.
-        - If the majority of checklist conditions are met (3 out of 4), prefer APPROVE.
-        - Your reason must reference a specific observable condition from the candle data above.
-        BAD reason: "Price is stabilizing"
-        GOOD reason: "RSI dropped to 28 on candle 13 and rose to 32 on candle 15, volume 1.4x average"
-        Note: If consecutive losses >= 3, be significantly more strict about APPROVE.
+        self.sync_unmanaged_live_holdings()
+        self.maybe_exit_positions()
+        self.log_position_audit()
 
-        Respond ONLY with raw JSON (no markdown, no explanation outside JSON):
-        {{
-            "decision": "APPROVE" or "REJECT",
-            "reason": "One specific sentence referencing actual candle data"
-        }}
-        """
+        before_positions = len(self._filter_positions_df(self.db.get_positions()))
+        self.decide_and_enter()
+        after_positions = len(self._filter_positions_df(self.db.get_positions()))
 
-        try:
-            resp = requests.post(CFG.ollama_url, json={
-                "model": CFG.ollama_model_fast,
-                "messages": [
-                    {"role": "system", "content": "You are a conservative Risk Manager. You ALWAYS respond with pure, valid JSON only — no extra text, no markdown, no explanations outside JSON."},
-                    {"role": "user",   "content": prompt}
-                ],
-                "stream": False,
-                # "format": "json",   ←←← 여기서도 제거
-                "options": {
-                    "temperature": 0.0,
-                    "top_p": 0.92,
-                    "num_predict": 180,
-                    "num_ctx": 8192
-                }
-            }, timeout=90)
+        balances = self.ex.get_balances()
+        available_krw = safe_float(balances.get("KRW", 0.0), 0.0)
+        equity = self.get_equity_krw()
+        capital_locked = available_krw < self.cfg.params.min_order_krw and equity > available_krw + 1.0
 
-            raw_resp = resp.json()
-            if "error" in raw_resp:
-                logger.error(f"[Gatekeeper] Ollama error: {raw_resp.get('error')}")
-                return {"decision": "REJECT", "reason": f"Ollama API error"}
+        if after_positions <= before_positions:
+            if capital_locked:
+                LOG.info(
+                    f"[STREAK] no_fill_streak 유지: available_krw={available_krw:,.0f} < min_order={self.cfg.params.min_order_krw:,.0f} (capital_locked)"
+                )
+            else:
+                self.no_fill_streak += 1
+        else:
+            self.no_fill_streak = 0
 
-            content = ""
-            if "message" in raw_resp and isinstance(raw_resp["message"], dict):
-                content = raw_resp["message"].get("content", "").strip()
+        self.db.set_meta("no_fill_streak", str(self.no_fill_streak))
+        self.record_equity_snapshot(note="cycle")
 
-            if not content:
-                logger.warning("[Gatekeeper] Empty content received")
-                return {"decision": "REJECT", "reason": "Empty response from validator"}
+        LOG.info(f"[STATS] HOLD top5: {self.hold_counter.most_common(5)}")
+        LOG.info(f"[STATS] GATE reject top5: {self.gate_reject_counter.most_common(5)}")
+        LOG.info(f"[SLEEP] {self.cfg.params.cycle_seconds}s (no_fill_streak={self.no_fill_streak})")
 
-            content = re.sub(r'^```json\s*|\s*```$', '', content.strip())
+    def run_forever(self):
+        if GMAIL_USER and GMAIL_PASSWORD and TARGET_EMAIL:
+            t = threading.Thread(target=email_log_rotation_scheduler, args=(self.email_report,), daemon=True)
+            t.start()
+            LOG.info("[EMAIL] 로그 메일 전송 스케줄러 시작")
 
+        while True:
             try:
-                parsed = json.loads(content)
-                decision = parsed.get("decision", "REJECT").upper()
-                reason = parsed.get("reason", "No reason provided").strip()
-            except json.JSONDecodeError:
-                logger.error(f"[Gatekeeper] JSON parse failed: {content}")
-                return {"decision": "REJECT", "reason": "Invalid JSON format from validator"}
-
-            if decision not in ["APPROVE", "REJECT"]:
-                decision = "REJECT"
-
-            logger.info(f"[AI Gatekeeper] {market} → {decision} | {reason}")
-            return {"decision": decision, "reason": reason}
-
-        except Exception as e:
-            logger.error(f"[Gatekeeper] Exception: {e}")
-            return {"decision": "REJECT", "reason": f"Gatekeeper internal error: {str(e)}"}
-
-    except Exception as e:
-        logger.error(f"[AI Gatekeeper] 검증 중 에러 발생: {e}")
-        # 에러 발생 시 안전하게 매수 거부
-        return {"decision": "REJECT", "reason": f"Gatekeeper Error: {e}"}
-
-def calculate_adaptive_sleep(no_signal_streak: int, risk_cfg: RiskConfig) -> int:
-    """신호 없음 연속 횟수에 따른 적응형 슬립 시간"""
-    if no_signal_streak <= 2:
-        return 60         # 1분
-    elif no_signal_streak <= 5:
-        return 120        # 2분
-    else:
-        return min(risk_cfg.max_sleep_sec, 300)
-
-def maybe_auto_relax_filters(ai_cfg: AIConfig, no_signal_streak: int) -> AIConfig:
-    recent_trades = db_get_recent_trades(limit=10)
-    if not recent_trades.empty:
-        recent_losses = int((recent_trades['pnl'] < 0).sum())
-        if recent_losses >= 6:  # 3 → 6: 절반 이상 손실일 때만 강화
-            logger.info(f"[AutoRelax] BLOCKED — recent losses={recent_losses}/10, tightening filters")
-            sg = ai_cfg.signal
-            sg.volume_confirm_mult = min(sg.volume_confirm_mult + 0.05, 0.9)  # 완만하게 강화
-            ai_cfg.save_to_db()
-            return ai_cfg
-
-    if no_signal_streak < 8:  # 15 → 8: 더 빠르게 완화 시작
-        return ai_cfg
-
-    sg = ai_cfg.signal
-    factor = min(1.0, (no_signal_streak - 7) * 0.05)
-    new_ppm = min(0.88, sg.price_pos_max + factor * 0.05)
-    if new_ppm > sg.price_pos_max:
-        logger.info(f"[AutoRelax] price_pos_max: {sg.price_pos_max:.2f} -> {new_ppm:.2f}")
-        sg.price_pos_max = new_ppm
-        ai_cfg.save_to_db()
-    return ai_cfg
+                self.cycle()
+            except Exception as e:
+                LOG.error(f"[CYCLE] 예외: {e}")
+            time.sleep(self.cfg.params.cycle_seconds)
 
 # ============================================================
-# 메인 루프
+# Entrypoint
 # ============================================================
-def run():
-    global AI_CFG
-    global NO_SIGNAL_STREAK
-    logger.info("=" * 60)
-    logger.info("[STARTUP] Trading Bot Started")
-    logger.info("=" * 60)
-    
-    init_db()
-    threading.Thread(target=log_rotation_scheduler, daemon=True).start()
-    
-    # DB에서 AI 설정 로드
-    AI_CFG = AIConfig.load_from_db()
-    AI_CFG = validate_and_clamp_config(AI_CFG)
-    
-    pub = BithumbPublic()
-    last_market_refresh = 0
-    last_strategy_refresh = 0
-    print_portfolio_summary()
-    
-    while True:
-        try:
-            logger.info("=" * 60)
-            logger.info(f"[CYCLE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info("=" * 60)
-            
-            params = AI_CFG.params
-            strategy = AI_CFG.strategy
-            sig_cfg = AI_CFG.signal
-            risk_cfg = AI_CFG.risk
-            
-            # 1. 캔들 수집
-            markets = [
-                m["market"] 
-                for m in pub.get_markets() 
-                if m["market"].startswith(CFG.quote + "-")
-            ][:CFG.universe_size]
-            collect_candles(markets)
-            collect_btc_reference_candles()
-            
-            # 2. AI 설정 갱신 (주기 체크)
-            elapsed_market   = (time.time() - last_market_refresh)   / 60
-            elapsed_strategy = (time.time() - last_strategy_refresh) / 60
 
-            if elapsed_market >= CFG.ai_market_refresh_min:
-                perf = analyze_trading_performance()
-                run_strategy = (elapsed_strategy >= CFG.ai_strategy_refresh_min)
-                
-                AI_CFG, summary = ai_refresh_all_configs(AI_CFG, perf, run_strategy=run_strategy)
-                train_signal_quality_model()
-                
-                params = AI_CFG.params
-                strategy = AI_CFG.strategy
-                sig_cfg = AI_CFG.signal
-                risk_cfg = AI_CFG.risk
-                
-                last_market_refresh = time.time()
-                
-                if run_strategy:
-                    last_strategy_refresh = time.time()
-                    logger.info("[AI] 1단계 + 2단계 모두 실행 완료")
-                else:
-                    logger.info("[AI] 1단계(시장 분석)만 실행, Config 유지")
-            
-            # 3. 기존 포지션 관리 (청산 체크)
-            positions = db_get_positions()
-            if not positions.empty:
-                for _, pos in positions.iterrows():
-                    market = pos["market"]
-                    if is_excluded_coin(market):
-                        continue
-                    
-                    actual_bal = get_coin_balance(market)
-                    if actual_bal <= 0:
-                        logger.info(f"SYNC: {market} 실제 잔고 없음 → DB 포지션 제거")
-                        db_remove_position(market)
-                        continue
-                    
-                    current_price = pub.get_current_price(market)
-                    if current_price is None:
-                        continue
-                    
-                    should_exit, reason = check_position_exit(
-                        market, current_price, pos, params, strategy, risk_cfg)
-                    
-                    if should_exit:
-                        actual_bal = get_coin_balance(market)  # 재확인
-                        if actual_bal <= 0:
-                            continue
-                        
-                        pos_entry_price = float(pos['entry_price'])
-                        pos_entry_time  = float(pos['entry_time'])
-                        pos_size        = float(pos['size'])
-                        pos_signal_type = str(pos.get('signal_type', 'unknown'))
-                        pos_confidence  = float(pos.get('confidence', 0.0))
+def main():
+    ap = argparse.ArgumentParser()
+    default_db = os.getenv("BOT_DB_PATH") or os.getenv("DB_PATH") or "bot.db"
+    ap.add_argument("--db", default=default_db, help="sqlite db path")
+    ap.add_argument("--dry-run", action="store_true", help="paper trading (default)")
+    ap.add_argument("--live", action="store_true", help="live trading (needs API keys)")
+    ap.add_argument("--once", action="store_true", help="run one cycle and exit")
+    args = ap.parse_args()
 
-                        if reason == "take_profit":
-                            half_bal = actual_bal / 2
-                            half_value = half_bal * current_price
+    dry = True
+    if args.live:
+        dry = False
+    elif args.dry_run:
+        dry = True
 
-                            if half_value < CFG.min_order_krw:
-                                logger.info(f"[FULL EXIT] {market} 절반 금액 소액 → 전량 익절")
-                                # 아래 전량 청산 로직으로 진행
-                            else:
-                                logger.info(f"[PARTIAL EXIT] {market} 50% 익절 @ {current_price:,.0f}")
-                                result = execute_order(market, "sell", current_price, half_bal, risk_cfg)
+    bot = TradingBot(db_path=args.db, dry_run=dry)
+    LOG.info(f"[BOOT] DB_PATH={os.path.abspath(args.db)}")
+    LOG.info(f"[BOOT] OLLAMA_URL={OLLAMA_URL} model={OLLAMA_MODEL} fast_model={OLLAMA_MODEL_FAST} email_summary={'on' if OLLAMA_EMAIL_SUMMARY else 'off'}")
+    LOG.info(f"[BOOT] excluded_symbols={sorted(normalize_excluded_symbols(bot.cfg.params.exclude))} initial_capital={INITIAL_CAPITAL_KRW:,.0f}")
 
-                                if result["success"]:
-                                    pnl_half = (current_price - pos_entry_price) * half_bal
-                                    pnl_half -= (pos.get("entry_fee", 0) * 0.5 + result["fee"])
-                                    holding_h = (time.time() - pos_entry_time) / 3600
+    bot.cfg.save_to_db(args.db)
 
-                                    con = sqlite3.connect(CFG.db_path)
-                                    cur = con.cursor()
-                                    cur.execute("""
-                                        INSERT INTO trades
-                                        (market, direction, entry_price, exit_price, size,
-                                         entry_time, exit_time, pnl, total_fee, holding_hours, exit_reason)
-                                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                                    """, (
-                                        market, pos.get("direction", "long"),
-                                        pos_entry_price, current_price, half_bal,
-                                        pos_entry_time, int(time.time()),
-                                        pnl_half, result["fee"], holding_h, "partial_take_profit"
-                                    ))
-                                    
-                                    new_stop = pos_entry_price * 1.003
-                                    cur.execute(
-                                        "UPDATE positions SET stop_loss=?, size=? WHERE market=?",
-                                        (new_stop, half_bal, market)
-                                    )
-                                    con.commit()
-                                    con.close()
-
-                                    logger.info(f"[HALF PROFIT] {market} 잔여 {half_bal:.6f} | "
-                                                f"스톱 {pos['stop_loss']:,.0f} → {new_stop:,.0f}")
-                                else:
-                                    logger.warning(f"[PARTIAL EXIT FAIL] {market} → 다음 사이클 재시도")
-                                continue
-
-                        # 전량 청산
-                        logger.info(f"[EXIT] {market} @ {current_price:,.0f} ({reason})")
-                        result = execute_order(market, "sell", current_price, actual_bal, risk_cfg)
-
-                        if result["success"]:
-                            pnl = (current_price - pos_entry_price) * pos_size
-                            pnl -= (pos.get("entry_fee", 0) + result["fee"])
-                            holding_h = (time.time() - pos_entry_time) / 3600
-
-                            # 진입 시점 RSI, vol_ratio 재계산
-                            try:
-                                df_entry = db_get_candles(market, '15m', limit=5)
-                                rsi_entry = vol_ratio_entry = 0.0
-                                if not df_entry.empty:
-                                    df_entry['volume_ma'] = df_entry['volume'].rolling(20, min_periods=1).mean()
-                                    last_e = df_entry.iloc[-1]
-                                    rsi_entry = float(last_e.get('rsi', 0.0))
-                                    if last_e['volume_ma'] > 0:
-                                        vol_ratio_entry = last_e['volume'] / last_e['volume_ma']
-                            except Exception:
-                                pass
-
-                            con = sqlite3.connect(CFG.db_path)
-                            cur = con.cursor()
-                            cur.execute("""
-                                INSERT INTO trades
-                                (market, direction, entry_price, exit_price, size,
-                                 entry_time, exit_time, pnl, total_fee, holding_hours, exit_reason,
-                                 signal_type, confidence, rsi_at_entry, vol_ratio_at_entry)
-                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                            """, (
-                                market, pos.get('direction', 'long'), pos_entry_price, current_price,
-                                pos_size, pos_entry_time, int(time.time()), pnl, result['fee'], holding_h, reason,
-                                pos_signal_type, pos_confidence, rsi_entry, vol_ratio_entry
-                            ))
-                            con.commit()
-                            con.close()
-                            db_remove_position(market)
-            
-            # 4. 신규 매수 신호 스캔
-            positions = db_get_positions()
-            ai_pos_count = sum(1 for _, p in positions.iterrows() if not is_excluded_coin(p["market"]))
-            
-            signals = []
-            
-            if ai_pos_count >= params.max_positions:
-                logger.info(f"[INFO] Max positions reached: {ai_pos_count}/{params.max_positions}")
-            else:
-                for market in markets:
-                    if is_excluded_coin(market):
-                        continue
-                    if market in positions["market"].values:
-                        continue
-
-                    sig = generate_swing_signals(market, params, strategy, sig_cfg)
-                    if sig["signal"] == "buy":
-                        signals.append((market, sig))
-                    else:
-                        HOLD_REASON_COUNTS[sig.get("reason", "unknown")] += 1
-            
-            # 신호가 있으면 잔고 먼저 확인 (LLM 호출 전에!)
-            if signals:
-                avail_krw = get_available_krw_balance()
-                MIN_REQUIRED_KRW = int(CFG.min_order_krw * 1.15)
-                
-                if avail_krw < MIN_REQUIRED_KRW:
-                    logger.warning(f"[SKIP ALL] KRW 잔고 부족 ({avail_krw:,.0f} < {MIN_REQUIRED_KRW:,} 필요)")
-                    NO_SIGNAL_STREAK += 1
-                    sleep_sec = calculate_adaptive_sleep(NO_SIGNAL_STREAK, risk_cfg)
-                    logger.info(f"[SLEEP] 잔고 부족 대기 {sleep_sec}s (streak={NO_SIGNAL_STREAK})")
-                    time.sleep(sleep_sec)
-                    continue
-                
-                logger.info(f"[SIGNAL] {len(signals)} buy signals | KRW: {avail_krw:,.0f}원")
-                
-                slots = params.max_positions - ai_pos_count
-                last_entries = json.loads(db_get_meta("last_entries", "{}"))
-                current_time = time.time()
-                filled = 0
-                HARD_BLOCK_THRESHOLD = 4
-
-                for market, signal in signals:
-                    if filled >= slots:
-                        break
-
-                    # 쿨다운 & 연속손실 체크
-                    if market in last_entries:
-                        elapsed = (current_time - last_entries[market]) / 60
-                        recent = db_get_recent_trades_by_market(market, limit=10)
-                        last_exit = recent.iloc[0]['exit_reason'] if not recent.empty else 'nohistory'
-                        consec = get_consecutive_losses_by_market(market, limit=10)
-
-                        if last_exit in ('max_loss', 'stop_loss'):
-                            minwait = calc_escalating_cooldown(consec, risk_cfg.cooldown_after_loss)
-                        elif last_exit == 'pullback_from_profit':
-                            minwait = calc_escalating_cooldown(max(0, consec - 1), risk_cfg.cooldown_after_win)
-                        elif last_exit == 'take_profit':
-                            minwait = risk_cfg.cooldown_after_win
-                        else:
-                            minwait = risk_cfg.cooldown_default
-
-                        if consec >= HARD_BLOCK_THRESHOLD:
-                            if elapsed < minwait:
-                                logger.info(f"HARD_BLOCK {market} 연속손실{consec}회 {elapsed:.0f}/{minwait}min")
-                                continue
-                            else:
-                                last_entries[market] = current_time
-                                db_set_meta("last_entries", json.dumps(last_entries))
-                                logger.info(f"HARD_BLOCK {market} 타이머 리셋 → 수익나올 때까지 차단 유지")
-                                continue
-
-                        if elapsed < minwait:
-                            logger.info(f"COOLDOWN {market} {elapsed:.0f}/{minwait}min (연속손실{consec}회)")
-                            continue
-
-                    # Gatekeeper 호출 전 ML 필터
-                    entry_price = float(signal["price"])
-                    signal_reason = signal.get("reason", "unknown")
-                    confidence = float(signal.get("confidence", 0.0))
-
-                    _rsi = float(signal.get('rsi', 50.0)) if 'rsi' in signal else 50.0
-                    _volr = 1.0
-                    ml_prob = predict_signal_quality(signal_reason, confidence, _rsi, _volr)
-
-                    if ml_prob < 0.35:
-                        logger.info(f"[ML_FILTER] {market} 승률예측 {ml_prob:.1%} < 35% → SKIP")
-                        GATE_REJECT_REASON_COUNTS[f"ML_filter_{signal_reason}"] += 1
-                        continue
-
-                    # Gatekeeper
-                    gate_pass = False
-                    if confidence >= risk_cfg.auto_pass_confidence:
-                        logger.info(f"[GATE] {market} conf={confidence:.2f} → AUTO PASS")
-                        gate_pass = True
-                    elif confidence >= risk_cfg.min_gate_confidence:
-                        df_verify = db_get_candles(market, "15m", limit=300)
-                        if df_verify.empty:
-                            continue
-
-                        df_verify["volume_ma"] = df_verify["volume"].rolling(20).mean()
-                        delta = df_verify["close"].diff()
-                        gain = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean()
-                        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14).mean()
-                        df_verify["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-10)))
-
-                        gate_result = ai_verify_buy_signal(market, entry_price, df_verify, signal_reason)
-                        decision = gate_result.get("decision", "REJECT").upper()
-                        reason = gate_result.get("reason", "no reason")
-
-                        if decision == "APPROVE":
-                            logger.info(f"[GATE APPROVE] {market} conf={confidence:.2f} | {reason}")
-                            gate_pass = True
-                        else:
-                            GATE_REJECT_REASON_COUNTS[reason] += 1
-                            logger.info(f"[GATE REJECT] {market} conf={confidence:.2f} | {reason}")
-                    else:
-                        logger.info(f"[GATE] {market} conf={confidence:.2f} < min → SKIP")
-
-                    if not gate_pass:
-                        continue
-
-                    # 포지션 사이징 & 주문
-                    invest = min(
-                        avail_krw * params.risk_per_trade * risk_cfg.risk_multiplier,
-                        avail_krw * risk_cfg.invest_capital_pct
-                    )
-                    invest = max(invest, (CFG.min_order_krw / (1 - strategy.max_loss_per_trade)) * 1.05)
-                    invest = min(invest, avail_krw * 0.95)
-
-                    buy_info = calculate_buy_fee_and_total(entry_price, invest / entry_price)
-                    if buy_info['total'] < CFG.min_order_krw * risk_cfg.min_order_mult:
-                        logger.warning(f"[SKIP] {market} 최소주문 미달")
-                        continue
-                    if buy_info['total'] > avail_krw:
-                        logger.warning(f"[SKIP] {market} 잔고 부족 (calc)")
-                        continue
-
-                    logger.info(f"[ORDER] {market} | invest={invest:,.0f} | total={buy_info['total']:,.0f}")
-
-                    size = invest / entry_price
-                    result = execute_order(market, "buy", entry_price, size, risk_cfg)
-
-                    if result["success"]:
-                        db_add_position(
-                            market, entry_price, size, signal['stop'], 'long', result['fee'],
-                            signal_type=signal_reason, confidence=confidence
-                        )
-                        last_entries[market] = current_time
-                        avail_krw -= buy_info["total"]
-                        filled += 1
-                        logger.info(f"[BUY SUCCESS] {market} @ {entry_price:,.0f}")
-
-                db_set_meta("last_entries", json.dumps(last_entries))
-            
-            # 신호 없음 처리
-            if not signals:
-                NO_SIGNAL_STREAK += 1
-                logger.info("[INFO] No buy signals this cycle")
-                logger.info(f"[STATS] HOLD top5: {HOLD_REASON_COUNTS.most_common(5)}")
-                logger.info(f"[STATS] GATE reject top5: {GATE_REJECT_REASON_COUNTS.most_common(5)}")
-                AI_CFG = maybe_auto_relax_filters(AI_CFG, NO_SIGNAL_STREAK)
-                sleep_sec = calculate_adaptive_sleep(NO_SIGNAL_STREAK, risk_cfg)
-            else:
-                NO_SIGNAL_STREAK = 0
-                sleep_sec = 60
-
-            logger.info(f"[SLEEP] {sleep_sec}s (streak={NO_SIGNAL_STREAK})")
-            time.sleep(sleep_sec)
-        
-        except KeyboardInterrupt:
-            logger.info("[SHUTDOWN] Bot stopped by user")
-            break
-        except Exception as e:
-            logger.error(f"[CRITICAL] 메인 루프 예외 발생", exc_info=True)
-            time.sleep(60)
+    interrupted = False
+    try:
+        if args.once:
+            bot.cycle()
+            return
+        bot.run_forever()
+    except KeyboardInterrupt:
+        interrupted = True
+        LOG.info("[SHUTDOWN] Ctrl+C 감지")
+    finally:
+        if interrupted:
+            bot.finalize_shutdown(reason="ctrl_c")
 
 if __name__ == "__main__":
-    run()
+    main()
